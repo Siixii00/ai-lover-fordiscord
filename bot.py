@@ -9,6 +9,7 @@ import time
 import random
 from flask import Flask
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # ───────── Flask 心跳伺服器 (修正 Railway 埠號綁定) ─────────
 app = Flask(__name__)
@@ -51,6 +52,14 @@ def load_config():
                     "personality": "",
                     "occupation": ""
                 })
+                data.setdefault("weather_reminder", {
+                    "enabled": False,
+                    "location": "",
+                    "time": "",
+                    "channel_id": 0,
+                    "timezone": "Asia/Taipei",
+                    "last_sent_date": ""
+                })
                 return data
         except:
             pass
@@ -66,6 +75,14 @@ def load_config():
             "appearance": "",
             "personality": "",
             "occupation": ""
+        },
+        "weather_reminder": {
+            "enabled": False,
+            "location": "",
+            "time": "",
+            "channel_id": 0,
+            "timezone": "Asia/Taipei",
+            "last_sent_date": ""
         }
     }
 
@@ -221,6 +238,8 @@ class MyClient(discord.Client):
         await self.tree.sync()
         # 啟動超時檢查背景任務
         self.loop.create_task(timeout_checker())
+        # 啟動每日天氣提醒背景任務
+        self.loop.create_task(weather_reminder_checker())
 
 client = MyClient()
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
@@ -410,6 +429,103 @@ async def fetch_weather_summary(location: str):
     except Exception as e:
         return f"❌ 無法取得天氣資料：{str(e)}"
 
+def is_valid_hhmm(time_str: str):
+    try:
+        datetime.strptime(time_str, "%H:%M")
+        return True
+    except:
+        return False
+
+def is_valid_timezone(tz_name: str):
+    try:
+        ZoneInfo(tz_name)
+        return True
+    except:
+        return False
+
+async def build_personalized_weather_text(location: str, raw_weather: str, channel_id=None):
+    """用目前 system_prompt 角色語氣包裝天氣提醒。"""
+    if raw_weather.startswith("❌") or raw_weather.startswith("⚠️"):
+        return raw_weather
+
+    if not config.get("api_key"):
+        return raw_weather
+
+    endpoint = f"{config['api_url'].rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config['api_key']}",
+        "Content-Type": "application/json"
+    }
+    system_content = build_system_prompt(channel_id=channel_id, author=None)
+    system_content += (
+        "\n\n【任務】"
+        "\n你現在要發送『天氣提醒』。"
+        "\n請使用目前角色個性與語氣，"
+        "內容包含：1) 目前天氣重點 2) 一句貼心的生活建議。"
+        "\n請僅依據提供的原始天氣資料，不可捏造數字。"
+    )
+    body = {
+        "model": config["model"],
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"地點：{location}\n原始天氣資料：\n{raw_weather}"}
+        ]
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, headers=headers, json=body, timeout=20) as resp:
+                if resp.status != 200:
+                    return raw_weather
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+    except:
+        return raw_weather
+
+async def weather_reminder_checker():
+    """每天定時推送一次天氣提醒到指定頻道。"""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(20)
+
+        reminder = config.get("weather_reminder", {})
+        if not reminder.get("enabled", False):
+            continue
+
+        location = str(reminder.get("location", "")).strip()
+        remind_time = str(reminder.get("time", "")).strip()
+        tz_name = str(reminder.get("timezone", "")).strip()
+        channel_id = int(reminder.get("channel_id", 0) or 0)
+
+        if not location or not remind_time or not tz_name or channel_id <= 0:
+            continue
+        if not is_valid_hhmm(remind_time) or not is_valid_timezone(tz_name):
+            continue
+
+        now_local = datetime.now(ZoneInfo(tz_name))
+        if now_local.strftime("%H:%M") != remind_time:
+            continue
+
+        today = now_local.strftime("%Y-%m-%d")
+        if reminder.get("last_sent_date") == today:
+            continue
+
+        channel = client.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except:
+                continue
+
+        try:
+            raw_weather = await fetch_weather_summary(location)
+            final_text = await build_personalized_weather_text(location, raw_weather, channel_id=channel_id)
+            await channel.send(final_text)
+            config.setdefault("weather_reminder", {})["last_sent_date"] = today
+            save_config(config)
+        except:
+            pass
+
 # ───────── 背景任務：超時主動說話 ─────────
 async def timeout_checker():
     await client.wait_until_ready()
@@ -498,9 +614,15 @@ async def slash_config(interaction: discord.Interaction):
     if not is_owner(interaction): return
     forbidden_str = ", ".join(config["forbidden"]) if config["forbidden"] else "無"
     profile = config.get("user_profile", {})
+    reminder = config.get("weather_reminder", {})
     appearance = profile.get("appearance", "") or "未設定"
     personality = profile.get("personality", "") or "未設定"
     occupation = profile.get("occupation", "") or "未設定"
+    weather_enabled = "開啟" if reminder.get("enabled") else "關閉"
+    weather_location = reminder.get("location", "") or "未設定"
+    weather_time = reminder.get("time", "") or "未設定"
+    weather_channel = reminder.get("channel_id", 0) or "未設定"
+    weather_tz = reminder.get("timezone", "") or "未設定"
     info = (
         f"**🤖 機器人目前設定**\n"
         f"🔗 **API URL**: `{config['api_url']}`\n"
@@ -509,6 +631,11 @@ async def slash_config(interaction: discord.Interaction):
         f"👤 **主要使用者外觀**: `{appearance}`\n"
         f"👤 **主要使用者個性**: `{personality}`\n"
         f"👤 **主要使用者職業**: `{occupation}`\n"
+        f"🌦️ **天氣提醒**: `{weather_enabled}`\n"
+        f"🌦️ **提醒地點**: `{weather_location}`\n"
+        f"🌦️ **提醒時間**: `{weather_time}`\n"
+        f"🌦️ **提醒頻道ID**: `{weather_channel}`\n"
+        f"🌦️ **提醒時區**: `{weather_tz}`\n"
         f"🚫 **禁止詞**: `{forbidden_str}`\n"
         f"⏱️ **超時時間**: `{config['timeout_minutes']} 分鐘`"
     )
@@ -551,8 +678,63 @@ async def dinner(interaction: discord.Interaction):
 @client.tree.command(name="weather", description="根據地點提醒天氣")
 async def weather(interaction: discord.Interaction, location: str):
     await interaction.response.defer(ephemeral=True)
-    report = await fetch_weather_summary(location)
-    await interaction.followup.send(report, ephemeral=True)
+    raw_weather = await fetch_weather_summary(location)
+    final_text = await build_personalized_weather_text(location, raw_weather, channel_id=interaction.channel_id)
+    await interaction.followup.send(final_text, ephemeral=True)
+
+@client.tree.command(name="set_weather_reminder", description="設定每日定時天氣提醒（地點/時間/頻道ID/時區）")
+async def set_weather_reminder(
+    interaction: discord.Interaction,
+    location: str,
+    remind_time: str,
+    channel_id: int,
+    tz_name: str
+):
+    if not is_owner(interaction): return
+
+    if not is_valid_hhmm(remind_time):
+        await interaction.response.send_message("⚠️ 時間格式錯誤，請使用 HH:MM（24 小時制），例如 19:30。", ephemeral=True)
+        return
+
+    if not is_valid_timezone(tz_name):
+        await interaction.response.send_message("⚠️ 時區格式錯誤，請使用 IANA 時區名稱，例如 Asia/Taipei。", ephemeral=True)
+        return
+
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except:
+            await interaction.response.send_message("⚠️ 找不到該頻道 ID，或 Bot 沒有權限存取該頻道。", ephemeral=True)
+            return
+
+    config["weather_reminder"] = {
+        "enabled": True,
+        "location": location.strip(),
+        "time": remind_time,
+        "channel_id": int(channel.id),
+        "timezone": tz_name.strip(),
+        "last_sent_date": ""
+    }
+    save_config(config)
+    await interaction.response.send_message(
+        f"✅ 已設定天氣提醒：每天 `{remind_time}`（`{tz_name}`）推送到頻道 `{channel.id}`，地點 `{location}`。",
+        ephemeral=True
+    )
+
+@client.tree.command(name="clear_weather_reminder", description="關閉每日定時天氣提醒")
+async def clear_weather_reminder(interaction: discord.Interaction):
+    if not is_owner(interaction): return
+    config["weather_reminder"] = {
+        "enabled": False,
+        "location": "",
+        "time": "",
+        "channel_id": 0,
+        "timezone": "Asia/Taipei",
+        "last_sent_date": ""
+    }
+    save_config(config)
+    await interaction.response.send_message("✅ 已關閉每日定時天氣提醒。", ephemeral=True)
 
 @client.tree.command(name="set_profile", description="設定主要使用者外觀/個性/職業")
 async def set_profile(
