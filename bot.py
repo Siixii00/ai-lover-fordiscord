@@ -6,6 +6,7 @@ import aiohttp
 import threading
 import asyncio
 import time
+import random
 from flask import Flask
 from datetime import datetime, timedelta, timezone
 
@@ -45,6 +46,11 @@ def load_config():
                 data.setdefault("forbidden", [])
                 data.setdefault("timeout_minutes", 10)
                 data.setdefault("auto_chime_in", True)
+                data.setdefault("user_profile", {
+                    "appearance": "",
+                    "personality": "",
+                    "occupation": ""
+                })
                 return data
         except:
             pass
@@ -55,7 +61,12 @@ def load_config():
         "system_prompt": env_prompt,
         "forbidden": [],
         "timeout_minutes": 10,
-        "auto_chime_in": True
+        "auto_chime_in": True,
+        "user_profile": {
+            "appearance": "",
+            "personality": "",
+            "occupation": ""
+        }
     }
 
 def save_config(cfg):
@@ -108,6 +119,39 @@ def load_runtime_state():
 
 config = load_config()
 load_runtime_state()
+
+DINNER_OPTIONS = [
+    "日式咖哩飯",
+    "牛肉麵",
+    "壽司",
+    "韓式拌飯",
+    "泰式打拋豬",
+    "義大利麵",
+    "披薩",
+    "滷肉飯",
+    "雞肉飯",
+    "火鍋",
+    "麻辣燙",
+    "海鮮粥",
+    "鍋貼",
+    "水餃",
+    "燒肉飯",
+    "拉麵",
+    "炒飯",
+    "炒麵",
+    "漢堡",
+    "三明治",
+    "沙拉",
+    "關東煮",
+    "鹽酥雞",
+    "烤雞腿便當",
+    "蔬食便當",
+    "咖哩烏龍",
+    "清燉雞湯麵",
+    "壽喜燒",
+    "鐵板燒",
+    "燉飯"
+]
 
 def _extract_speaker_and_text(content: str):
     """從 `顯示名稱: 訊息內容` 格式中切出發言者與內容。"""
@@ -210,6 +254,21 @@ def build_system_prompt(channel_id=None, author=None):
         else:
             prompt += f"\n身份：他是你主人的【朋友】。你可以對他友善，但要清楚知道誰才是真正的戀人。"
 
+        if is_boss:
+            profile = config.get("user_profile", {})
+            appearance = profile.get("appearance", "").strip()
+            personality = profile.get("personality", "").strip()
+            occupation = profile.get("occupation", "").strip()
+            prompt += "\n\n【主要使用者設定】"
+            prompt += f"\n外觀：{appearance or '（未設定）'}"
+            prompt += f"\n個性：{personality or '（未設定）'}"
+            prompt += f"\n職業：{occupation or '（未設定）'}"
+            prompt += (
+                "\n你必須讀取並記住上述設定，"
+                "在回覆主要使用者時融入外觀、個性與職業相關的細節，"
+                "以提升代入感。"
+            )
+
     # 身分辨識與上下文一致性規範（所有情境都必須遵守）
     prompt += (
         "\n\n【回覆前必做流程】"
@@ -229,8 +288,17 @@ def build_system_prompt(channel_id=None, author=None):
         prompt += f"\n\n【絕對禁令】請絕對避免討論或提及以下話題：{forbidden_list}。如果使用者問到，請禮貌拒絕。"
     return prompt
 
+def profile_incomplete():
+    profile = config.get("user_profile", {})
+    return any(
+        not str(profile.get(key, "")).strip()
+        for key in ["appearance", "personality", "occupation"]
+    )
+
 async def call_api(channel_id, user_text=None, special_instruction=None, author=None):
     if not config["api_key"]: return "⚠️ 請先設定 API Key。"
+    if author and author.id == OWNER_ID and profile_incomplete():
+        return "⚠️ 主要使用者的外觀、個性或職業尚未設定，請先使用 /set_profile 完成設定。"
     
     endpoint = f"{config['api_url'].rstrip('/')}/chat/completions"
     headers = {
@@ -303,6 +371,44 @@ async def check_if_should_chime(message):
                 return result.get("chime", False), ""
     except:
         return False, ""
+
+# ───────── 天氣查詢工具 ─────────
+async def fetch_weather_summary(location: str):
+    """使用 wttr.in 取得天氣資訊（免金鑰）"""
+    query = location.strip()
+    if not query:
+        return "⚠️ 請提供有效地點。"
+
+    url = f"https://wttr.in/{query}?format=j1"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200:
+                    return f"❌ 天氣服務錯誤 ({resp.status})，請稍後再試。"
+                data = await resp.json()
+
+        current = (data.get("current_condition") or [{}])[0]
+        nearest = (data.get("nearest_area") or [{}])[0]
+        area = ((nearest.get("areaName") or [{}])[0].get("value") or query)
+        region = ((nearest.get("region") or [{}])[0].get("value") or "")
+        country = ((nearest.get("country") or [{}])[0].get("value") or "")
+
+        desc = ((current.get("weatherDesc") or [{}])[0].get("value") or "未知")
+        temp_c = current.get("temp_C", "-")
+        feels_c = current.get("FeelsLikeC", "-")
+        humidity = current.get("humidity", "-")
+        wind_kph = current.get("windspeedKmph", "-")
+
+        location_display = "、".join([p for p in [area, region, country] if p])
+        return (
+            f"🌦️ {location_display} 天氣提醒\n"
+            f"- 目前天氣：{desc}\n"
+            f"- 溫度：{temp_c}°C（體感 {feels_c}°C）\n"
+            f"- 濕度：{humidity}%\n"
+            f"- 風速：{wind_kph} km/h"
+        )
+    except Exception as e:
+        return f"❌ 無法取得天氣資料：{str(e)}"
 
 # ───────── 背景任務：超時主動說話 ─────────
 async def timeout_checker():
@@ -391,11 +497,18 @@ async def model_autocomplete(interaction: discord.Interaction, current: str):
 async def slash_config(interaction: discord.Interaction):
     if not is_owner(interaction): return
     forbidden_str = ", ".join(config["forbidden"]) if config["forbidden"] else "無"
+    profile = config.get("user_profile", {})
+    appearance = profile.get("appearance", "") or "未設定"
+    personality = profile.get("personality", "") or "未設定"
+    occupation = profile.get("occupation", "") or "未設定"
     info = (
         f"**🤖 機器人目前設定**\n"
         f"🔗 **API URL**: `{config['api_url']}`\n"
         f"🤖 **模型**: `{config['model']}`\n"
         f"📝 **個性**: `{config['system_prompt']}`\n"
+        f"👤 **主要使用者外觀**: `{appearance}`\n"
+        f"👤 **主要使用者個性**: `{personality}`\n"
+        f"👤 **主要使用者職業**: `{occupation}`\n"
         f"🚫 **禁止詞**: `{forbidden_str}`\n"
         f"⏱️ **超時時間**: `{config['timeout_minutes']} 分鐘`"
     )
@@ -429,6 +542,33 @@ async def set_prompt(interaction: discord.Interaction, prompt: str):
     config["system_prompt"] = prompt
     save_config(config)
     await interaction.response.send_message(f"✅ 個性設定已更新！", ephemeral=True)
+
+@client.tree.command(name="dinner", description="隨機推薦一個晚餐選項")
+async def dinner(interaction: discord.Interaction):
+    suggestion = random.choice(DINNER_OPTIONS)
+    await interaction.response.send_message(f"🍽️ 今日晚餐推薦：**{suggestion}**", ephemeral=True)
+
+@client.tree.command(name="weather", description="根據地點提醒天氣")
+async def weather(interaction: discord.Interaction, location: str):
+    await interaction.response.defer(ephemeral=True)
+    report = await fetch_weather_summary(location)
+    await interaction.followup.send(report, ephemeral=True)
+
+@client.tree.command(name="set_profile", description="設定主要使用者外觀/個性/職業")
+async def set_profile(
+    interaction: discord.Interaction,
+    appearance: str,
+    personality: str,
+    occupation: str
+):
+    if not is_owner(interaction): return
+    config["user_profile"] = {
+        "appearance": appearance,
+        "personality": personality,
+        "occupation": occupation
+    }
+    save_config(config)
+    await interaction.response.send_message("✅ 主要使用者設定已更新！", ephemeral=True)
 
 @client.tree.command(name="add_forbidden", description="新增禁止提及的詞彙")
 async def add_forbidden(interaction: discord.Interaction, word: str):
