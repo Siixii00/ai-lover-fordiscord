@@ -777,8 +777,9 @@ async def set_timeout(interaction: discord.Interaction, minutes: int):
 @client.tree.command(name="sync", description="強制同步指令選單")
 async def sync(interaction: discord.Interaction):
     if not is_owner(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await client.tree.sync()
-    await interaction.response.send_message("🔄 指令已同步，請重啟 Discord 查看。", ephemeral=True)
+    await interaction.followup.send("🔄 指令已同步，請重啟 Discord 查看。", ephemeral=True)
 
 # ───────── 啟動 ─────────
 if __name__ == "__main__":
