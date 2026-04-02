@@ -36,7 +36,57 @@ MEMORY_FILE = "memory.json"
 CHAT_LOG_DIR = "chat_logs"
 VOICE_CONFIG_FILE = "voice_profiles.json"
 VOICE_RANDOM_RATE = float(os.environ.get("VOICE_RANDOM_RATE", "0.3"))
-VOICE_MAX_BYTES = int(os.environ.get("VOICE_MAX_BYTES", str(8 * 1024 * 1024)))
+
+TEXT_LANG_CHOICES = [
+    app_commands.Choice(name="繁體中文", value="繁體中文"),
+    app_commands.Choice(name="簡體中文", value="簡體中文"),
+    app_commands.Choice(name="English", value="English"),
+    app_commands.Choice(name="한국어", value="한국어"),
+    app_commands.Choice(name="日本語", value="日本語"),
+    app_commands.Choice(name="Español", value="Español"),
+    app_commands.Choice(name="Français", value="Français"),
+    app_commands.Choice(name="Deutsch", value="Deutsch"),
+]
+
+VOICE_LANG_CHOICES = [
+    app_commands.Choice(name="繁體中文 (zho_Hant)", value="zho_Hant"),
+    app_commands.Choice(name="簡體中文 (zho_Hans)", value="zho_Hans"),
+    app_commands.Choice(name="English (eng_Latn)", value="eng_Latn"),
+    app_commands.Choice(name="한국어 (kor_Hang)", value="kor_Hang"),
+    app_commands.Choice(name="日本語 (jpn_Jpan)", value="jpn_Jpan"),
+    app_commands.Choice(name="Español (spa_Latn)", value="spa_Latn"),
+    app_commands.Choice(name="Français (fra_Latn)", value="fra_Latn"),
+    app_commands.Choice(name="Deutsch (deu_Latn)", value="deu_Latn"),
+]
+
+TEXT_LANG_TO_NLLB = {
+    "繁體中文": "zho_Hant",
+    "簡體中文": "zho_Hans",
+    "English": "eng_Latn",
+    "한국어": "kor_Hang",
+    "日本語": "jpn_Jpan",
+    "Español": "spa_Latn",
+    "Français": "fra_Latn",
+    "Deutsch": "deu_Latn",
+}
+
+def _parse_size_to_bytes(raw: str) -> int:
+    if raw is None:
+        return 8 * 1024 * 1024
+    text = str(raw).strip().lower()
+    if not text:
+        return 8 * 1024 * 1024
+    if text.isdigit():
+        return int(text)
+    match = re.match(r"^(\d+(?:\.\d+)?)(kb|mb|gb)$", text)
+    if not match:
+        return 8 * 1024 * 1024
+    value = float(match.group(1))
+    unit = match.group(2)
+    factor = {"kb": 1024, "mb": 1024 ** 2, "gb": 1024 ** 3}[unit]
+    return int(value * factor)
+
+VOICE_MAX_BYTES = _parse_size_to_bytes(os.environ.get("VOICE_MAX_BYTES", str(8 * 1024 * 1024)))
 
 def load_config():
     env_api_url = os.environ.get("API_URL", "https://api.openai.com/v1")
@@ -46,7 +96,6 @@ def load_config():
     env_roleplay_prompt = os.environ.get("ROLEPLAY_PROMPT", "")
     env_character_prompt = os.environ.get("CHARACTER_PROMPT", "")
     env_hf_space_url = os.environ.get("HF_SPACE_URL", "")
-    env_user_id = os.environ.get("VOICE_USER_ID", "")
     env_sample_id = os.environ.get("VOICE_SAMPLE_ID", "")
 
     default_forbidden_words = [
@@ -109,9 +158,12 @@ def load_config():
                 })
                 data.setdefault("voice_default", {
                     "hf_space_url": env_hf_space_url,
-                    "user_id": env_user_id,
                     "sample_id": env_sample_id
                 })
+                if env_hf_space_url:
+                    data["voice_default"]["hf_space_url"] = env_hf_space_url
+                if env_sample_id:
+                    data["voice_default"]["sample_id"] = env_sample_id
                 return data
         except:
             pass
@@ -164,7 +216,6 @@ def load_config():
         },
         "voice_default": {
             "hf_space_url": env_hf_space_url,
-            "user_id": env_user_id,
             "sample_id": env_sample_id
         }
     }
@@ -412,19 +463,26 @@ async def request_tts_from_hf(text: str, profile: dict, target_lang: Optional[st
         if candidates:
             sample_id = random.choice(candidates)
 
+    voice_lang = (target_lang or str(profile.get("voice_lang", "")).strip())
+    source_lang_label = str(profile.get("text_lang", "")).strip()
+    source_lang = TEXT_LANG_TO_NLLB.get(source_lang_label, "")
+    auto_translate = bool(voice_lang)
+
     payload = {
         "user_id": profile.get("user_id", ""),
         "sample_id": sample_id,
         "text": text,
         "chunked": bool(force_chunked),
         "max_bytes": VOICE_MAX_BYTES,
-        "auto_translate": True,
+        "auto_translate": auto_translate,
     }
-    if target_lang:
-        payload["target_lang"] = target_lang
+    if voice_lang:
+        payload["target_lang"] = voice_lang
+    if source_lang:
+        payload["source_lang"] = source_lang
 
     headers = {"Content-Type": "application/json"}
-    token = _resolve_hf_token(profile)
+    token = os.environ.get("HF_TOKEN", "")
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -445,8 +503,8 @@ async def request_tts_from_hf(text: str, profile: dict, target_lang: Optional[st
         return {"error": f"HF 連線失敗: {str(e)}"}
 
 async def send_voice_response(channel: discord.abc.Messageable, text: str, profile: dict, target_lang: Optional[str] = None):
-    if not profile.get("user_id") or not profile.get("sample_id"):
-        await channel.send("⚠️ 尚未設定語音樣本。請使用 /voice set 設定 user_id / sample_id。")
+    if not profile.get("sample_id"):
+        await channel.send("⚠️ 尚未設定語音樣本。請使用 /voice action:set 設定 sample_id。")
         return
 
     result = await request_tts_from_hf(text=text, profile=profile, target_lang=target_lang)
@@ -1241,7 +1299,6 @@ async def slash_config(
 
     voice_default = config.get("voice_default", {})
     voice_space_url = voice_default.get("hf_space_url", "") or "未設定"
-    voice_user_id = voice_default.get("user_id", "") or "未設定"
     voice_sample_id = voice_default.get("sample_id", "") or "未設定"
     voice_text_lang = voice_default.get("text_lang", "") or "未設定"
     voice_voice_lang = voice_default.get("voice_lang", "") or "未設定"
@@ -1324,7 +1381,6 @@ async def slash_config(
             "title": "🔊 語音設定",
             "fields": {
                 "voice_space_url": ("HF Space URL", voice_space_url),
-                "voice_user_id": ("Voice User ID", voice_user_id),
                 "voice_sample_id": ("Voice Sample ID", voice_sample_id),
                 "voice_text_lang": ("Text Language", voice_text_lang),
                 "voice_voice_lang": ("Voice Language", voice_voice_lang)
@@ -1695,59 +1751,39 @@ async def reroll(interaction: discord.Interaction):
     action=[
         app_commands.Choice(name="set", value="set"),
         app_commands.Choice(name="show", value="show"),
-        app_commands.Choice(name="clear", value="clear"),
-        app_commands.Choice(name="speak", value="speak"),
-        app_commands.Choice(name="enable", value="enable"),
-        app_commands.Choice(name="disable", value="disable")
+        app_commands.Choice(name="clear", value="clear")
     ]
 )
+@app_commands.choices(text_lang=TEXT_LANG_CHOICES, voice_lang=VOICE_LANG_CHOICES)
 async def voice(
     interaction: discord.Interaction,
     action: app_commands.Choice[str],
     hf_space_url: Optional[str] = None,
-    dataset_repo: Optional[str] = None,
-    user_id: Optional[str] = None,
     sample_id: Optional[str] = None,
-    text_lang: Optional[str] = None,
-    voice_lang: Optional[str] = None,
-    text: Optional[str] = None,
+    text_lang: Optional[app_commands.Choice[str]] = None,
+    voice_lang: Optional[app_commands.Choice[str]] = None,
+    enabled: Optional[bool] = None,
+    test_text: Optional[str] = None,
 ):
     await interaction.response.defer(ephemeral=True)
     user_key = str(interaction.user.id)
-
-    if action.value == "enable":
-        profile = get_voice_profile(interaction.user.id)
-        profile["enabled"] = True
-        set_voice_profile(interaction.user.id, profile)
-        await interaction.followup.send("✅ 已啟用你的語音功能。", ephemeral=True)
-        return
-
-    if action.value == "disable":
-        profile = get_voice_profile(interaction.user.id)
-        profile["enabled"] = False
-        set_voice_profile(interaction.user.id, profile)
-        await interaction.followup.send("✅ 已停用你的語音功能。", ephemeral=True)
-        return
 
     if action.value == "set":
         profile = get_voice_profile(interaction.user.id)
         if hf_space_url:
             profile["hf_space_url"] = hf_space_url.strip()
-        if dataset_repo:
-            profile["dataset_repo"] = dataset_repo.strip()
-        if user_id:
-            profile["user_id"] = user_id.strip()
         if sample_id:
             profile["sample_id"] = sample_id.strip()
         if text_lang:
-            profile["text_lang"] = text_lang.strip()
+            profile["text_lang"] = text_lang.value.strip()
         if voice_lang:
-            profile["voice_lang"] = voice_lang.strip()
+            profile["voice_lang"] = voice_lang.value.strip()
+        if enabled is not None:
+            profile["enabled"] = bool(enabled)
         set_voice_profile(interaction.user.id, profile)
-        await interaction.followup.send(
-            "✅ 已更新你的語音設定。",
-            ephemeral=True
-        )
+        await interaction.followup.send("✅ 已更新你的語音設定。", ephemeral=True)
+        if test_text:
+            await send_voice_response(interaction.channel, test_text, profile)
         return
 
     if action.value == "show":
@@ -1757,8 +1793,6 @@ async def voice(
             return
         masked = {
             "hf_space_url": profile.get("hf_space_url", ""),
-            "dataset_repo": profile.get("dataset_repo", ""),
-            "user_id": profile.get("user_id", ""),
             "sample_id": profile.get("sample_id", ""),
             "text_lang": profile.get("text_lang", ""),
             "voice_lang": profile.get("voice_lang", ""),
@@ -1774,17 +1808,6 @@ async def voice(
         await interaction.followup.send("✅ 已清除你的語音設定。", ephemeral=True)
         return
 
-    if action.value == "speak":
-        profile = get_voice_profile(interaction.user.id)
-        if not profile:
-            await interaction.followup.send("⚠️ 尚未設定語音資料。使用 /voice action:set 來設定。", ephemeral=True)
-            return
-        if not text:
-            await interaction.followup.send("⚠️ 請提供要朗讀的文字。", ephemeral=True)
-            return
-        await interaction.followup.send("✅ 正在生成語音…", ephemeral=True)
-        await send_voice_response(interaction.channel, text, profile)
-        return
 
 @client.tree.command(name="clear_summary_time", description="關閉每日總結排程")
 async def clear_summary_time(interaction: discord.Interaction):
