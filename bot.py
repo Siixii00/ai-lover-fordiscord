@@ -336,19 +336,49 @@ def _parse_channel_id(raw: str) -> Optional[int]:
         return None
 
 # ───────── 核心工具：拉取模型清單 ─────────
+def _normalize_api_base(api_url: str) -> str:
+    if not api_url:
+        return ""
+    base = str(api_url).strip().rstrip("/")
+    # 若已包含 /v1 或更深層路徑，截到 /v1
+    match = re.search(r"^(.*?/v1)(/.*)?$", base)
+    if match:
+        return match.group(1)
+    return f"{base}/v1"
+
 async def fetch_models():
     """從自定義 API 網址拉取可用模型列表供選單使用"""
-    if not config["api_key"] or not config["api_url"]:
+    if not config.get("api_key") or not config.get("api_url"):
         return []
-    url = f"{config['api_url'].rstrip('/')}/models"
+    base = _normalize_api_base(config.get("api_url", ""))
+    if not base:
+        return []
+    url = f"{base}/models"
     headers = {"Authorization": f"Bearer {config['api_key']}"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=5) as resp:
+            async with session.get(url, headers=headers, timeout=8) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    models = [m["id"] for m in data.get("data", [])]
-                    return sorted(models)
+                    data = await resp.json(content_type=None)
+                    payload = data
+                    if isinstance(data, dict):
+                        payload = data.get("data", data.get("models", []))
+                    models = []
+                    if isinstance(payload, list):
+                        for item in payload:
+                            if isinstance(item, str):
+                                models.append(item)
+                            elif isinstance(item, dict):
+                                model_id = (
+                                    item.get("id")
+                                    or item.get("name")
+                                    or item.get("model")
+                                    or item.get("value")
+                                )
+                                if model_id:
+                                    models.append(str(model_id))
+                    if models:
+                        return sorted(set(models))
     except:
         pass
     return []
