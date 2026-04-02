@@ -381,6 +381,12 @@ def get_voice_profile(user_id: int) -> dict:
         return default_profile
     return {}
 
+def is_voice_enabled(user_id: int) -> bool:
+    profile = get_voice_profile(user_id)
+    if isinstance(profile, dict) and "enabled" in profile:
+        return bool(profile.get("enabled"))
+    return True
+
 def set_voice_profile(user_id: int, profile: dict) -> None:
     voice_profiles[str(user_id)] = profile
     save_voice_profiles(voice_profiles)
@@ -399,9 +405,16 @@ async def request_tts_from_hf(text: str, profile: dict, target_lang: Optional[st
     if not space_url:
         return {"error": "未設定 HF_SPACE_URL"}
 
+    raw_sample_id = str(profile.get("sample_id", "")).strip()
+    sample_id = raw_sample_id
+    if "," in raw_sample_id:
+        candidates = [s.strip() for s in raw_sample_id.split(",") if s.strip()]
+        if candidates:
+            sample_id = random.choice(candidates)
+
     payload = {
         "user_id": profile.get("user_id", ""),
-        "sample_id": profile.get("sample_id", ""),
+        "sample_id": sample_id,
         "text": text,
         "chunked": bool(force_chunked),
         "max_bytes": VOICE_MAX_BYTES,
@@ -683,6 +696,8 @@ async def call_api(channel_id, user_text=None, special_instruction=None, author=
 
 async def maybe_send_voice(channel, reply_text: str, author: Optional[discord.User] = None, force: bool = False):
     if not reply_text:
+        return
+    if author and not is_voice_enabled(author.id):
         return
     if not force and random.random() > VOICE_RANDOM_RATE:
         return
@@ -1681,7 +1696,9 @@ async def reroll(interaction: discord.Interaction):
         app_commands.Choice(name="set", value="set"),
         app_commands.Choice(name="show", value="show"),
         app_commands.Choice(name="clear", value="clear"),
-        app_commands.Choice(name="speak", value="speak")
+        app_commands.Choice(name="speak", value="speak"),
+        app_commands.Choice(name="enable", value="enable"),
+        app_commands.Choice(name="disable", value="disable")
     ]
 )
 async def voice(
@@ -1697,6 +1714,20 @@ async def voice(
 ):
     await interaction.response.defer(ephemeral=True)
     user_key = str(interaction.user.id)
+
+    if action.value == "enable":
+        profile = get_voice_profile(interaction.user.id)
+        profile["enabled"] = True
+        set_voice_profile(interaction.user.id, profile)
+        await interaction.followup.send("✅ 已啟用你的語音功能。", ephemeral=True)
+        return
+
+    if action.value == "disable":
+        profile = get_voice_profile(interaction.user.id)
+        profile["enabled"] = False
+        set_voice_profile(interaction.user.id, profile)
+        await interaction.followup.send("✅ 已停用你的語音功能。", ephemeral=True)
+        return
 
     if action.value == "set":
         profile = get_voice_profile(interaction.user.id)
@@ -1731,6 +1762,7 @@ async def voice(
             "sample_id": profile.get("sample_id", ""),
             "text_lang": profile.get("text_lang", ""),
             "voice_lang": profile.get("voice_lang", ""),
+            "enabled": profile.get("enabled", True)
         }
         await interaction.followup.send(f"你的語音設定：```json\n{json.dumps(masked, ensure_ascii=False, indent=2)}\n```", ephemeral=True)
         return
