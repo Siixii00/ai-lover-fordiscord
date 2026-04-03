@@ -336,6 +336,20 @@ def _contains_trigger(text: str, triggers: list[str]) -> bool:
             return True
     return False
 
+def _is_name_triggered(text: str) -> bool:
+    triggers = []
+    bot_name = str(config.get("bot_name", "")).strip()
+    bot_nickname = str(config.get("bot_nickname", "")).strip()
+    if bot_name:
+        triggers.append(bot_name)
+    if bot_nickname:
+        triggers.append(bot_nickname)
+    if client and client.user:
+        triggers.append(client.user.name)
+        if client.user.display_name:
+            triggers.append(client.user.display_name)
+    return _contains_trigger(text, triggers)
+
 def _write_wav_bytes(raw_pcm: bytes, sample_rate: int, channels: int, sample_width: int) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -1789,7 +1803,13 @@ async def on_message(message):
         if chime_prob <= 0 or random.random() > chime_prob:
             return
         
-        should_chime, _ = await check_if_should_chime(message.channel.id)
+        name_triggered = _is_name_triggered(message.content)
+        if name_triggered:
+            should_chime = True
+        elif chime_prob >= 0.8:
+            should_chime = True
+        else:
+            should_chime, _ = await check_if_should_chime(message.channel.id)
         
         if should_chime:
             async with message.channel.typing():
