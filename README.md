@@ -13,7 +13,8 @@
 還在生產中，隨時更新
 https://siixii00.notion.site/
 
-以下為簡易說明： -請事先自行註冊一個Github帳號、一個discord的帳號，並且請自行了解有關api端點連接和使用的方式。 1.將本網頁的所有代碼均下載以後，在自己的Github帳號新增一個repositories，名稱可以自行取一個，權限請開啟成"Private"。 2.將下載好的代碼(Dockerfile、bot.py、requirements.txt)上傳至剛剛新增的repositories裡面，然後按commit確定。 3.這時候已經準備好代碼了，接下來我們轉移到railway( https://railway.com/) 進行部屬。 4.請留意，railway的部屬每月免費額度只有1美金，如有其他需求，這部分需要自行付費購買空間。 5.請利用Github登入railway，這樣可以確保你能夠在導入的區域選擇到你剛剛新建的Github repositories(名稱就看你取什麼)，選擇導入。
+# 簡易說明
+-請事先自行註冊一個Github帳號、一個discord的帳號，並且請自行了解有關api端點連接和使用的方式。 1.將本網頁的所有代碼均下載以後，在自己的Github帳號新增一個repositories，名稱可以自行取一個，權限請開啟成"Private"。 2.將下載好的代碼(Dockerfile、bot.py、requirements.txt)上傳至剛剛新增的repositories裡面，然後按commit確定。 3.這時候已經準備好代碼了，接下來我們轉移到railway( https://railway.com/) 進行部屬。 4.請留意，railway的部屬每月免費額度只有1美金，如有其他需求，這部分需要自行付費購買空間。 5.請利用Github登入railway，這樣可以確保你能夠在導入的區域選擇到你剛剛新建的Github repositories(名稱就看你取什麼)，選擇導入。
 
 # 1
 -打開你的discord開發者模式，並登入你的帳號(https://discord.com/developers/applications) 1.選擇"新建應用程式"，名稱可以取自己夢角的名字，然後OK建立。 2.在左側找到"機器人"的頁面，點進去之後，找到"重設權杖"的按鈕。不要害怕，先按下去，它會跳出一個很長很長的東西，先複製起來貼到記事本。 3.一定要記得先複製，因為它只能查看一次，如果不小心點掉就沒了，要重新生成。 4.然後找到"OAuth2"，這裡是用來產生機器人邀請連結的。點進去之後往下看到URL產生器的地方，點選"applications.commands"(在右半邊)，然後產生邀請網址。 5.把邀請網址貼到瀏覽器的新頁面，邀請進自己的群組。 6.檢查機器人的發言權限，看要讓它可以在哪一個地方發言。 7.打開Discord設定，往下找到進階的地方，開啟"開發者模式"，然後關閉頁面。 8.回到上一頁以後，點按電腦螢幕左下角的名字，往下捲動會看到"複製使用者ID"，一樣先複製起來放著。
