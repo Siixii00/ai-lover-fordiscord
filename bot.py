@@ -1,6 +1,9 @@
 import discord
-from discord import app_commands
+from discord import sinks
 import os
+import functools
+import inspect
+from typing import get_args, get_origin, Union
 import json
 import aiohttp
 import threading
@@ -52,26 +55,188 @@ STT_LANGUAGE = str(os.environ.get("STT_LANGUAGE", "")).strip()
 STT_RETRY_COUNT = int(os.environ.get("STT_RETRY_COUNT", "2"))
 STT_RETRY_DELAY = float(os.environ.get("STT_RETRY_DELAY", "1.0"))
 
+class _AppCommandsCompat:
+    class Choice(discord.OptionChoice):
+        def __class_getitem__(cls, item):
+            return cls
+
+    @staticmethod
+    def choices(**kwargs):
+        def decorator(func):
+            items = func.__dict__.setdefault("_kilo_choices", [])
+            for param, choices in kwargs.items():
+                items.append((param, choices))
+            return func
+        return decorator
+
+    @staticmethod
+    def autocomplete(**kwargs):
+        def decorator(func):
+            items = func.__dict__.setdefault("_kilo_autocomplete", [])
+            for param, ac in kwargs.items():
+                items.append((param, ac))
+            return func
+        return decorator
+
+
+app_commands = _AppCommandsCompat
+
+
+class _InteractionResponseAdapter:
+    def __init__(self, ctx):
+        self._ctx = ctx
+
+    async def send_message(self, content=None, ephemeral=False, **kwargs):
+        await self._ctx.respond(content=content, ephemeral=ephemeral, **kwargs)
+
+    async def defer(self, ephemeral=False, **kwargs):
+        await self._ctx.defer(ephemeral=ephemeral, **kwargs)
+
+
+class _InteractionFollowupAdapter:
+    def __init__(self, ctx):
+        self._ctx = ctx
+
+    async def send(self, content=None, ephemeral=False, **kwargs):
+        await self._ctx.followup.send(content=content, ephemeral=ephemeral, **kwargs)
+
+
+class _InteractionAdapter:
+    def __init__(self, ctx):
+        self._ctx = ctx
+        self.user = ctx.user
+        self.channel = ctx.channel
+        self.channel_id = ctx.channel_id
+        self.guild = getattr(ctx, "guild", None)
+        self.response = _InteractionResponseAdapter(ctx)
+        self.followup = _InteractionFollowupAdapter(ctx)
+
+    def __getattr__(self, name):
+        return getattr(self._ctx, name)
+
+
+class _CommandTreeCompat:
+    def __init__(self, bot: discord.Bot):
+        self._bot = bot
+
+    def command(self, name: Optional[str] = None, description: Optional[str] = None):
+        def decorator(func):
+            cmd_name = name or func.__name__
+            cmd_desc = description or (func.__doc__ or "")
+
+            def _is_choice_annotation(annotation) -> bool:
+                if annotation is inspect._empty:
+                    return False
+                if annotation is app_commands.Choice:
+                    return True
+                if hasattr(annotation, "__mro__") and app_commands.Choice in getattr(annotation, "__mro__", []):
+                    return True
+                origin = get_origin(annotation)
+                if origin is None:
+                    return False
+                return any(_is_choice_annotation(arg) for arg in get_args(annotation))
+
+            @functools.wraps(func)
+            async def wrapper(ctx, *args, **kwargs):
+                interaction = _InteractionAdapter(ctx)
+                sig = inspect.signature(func)
+                bound = sig.bind_partial(interaction, *args, **kwargs)
+                for param_name, value in list(bound.arguments.items()):
+                    if param_name == list(sig.parameters.keys())[0]:
+                        continue
+                    annotation = sig.parameters[param_name].annotation
+                    if _is_choice_annotation(annotation) and not hasattr(value, "value"):
+                        bound.arguments[param_name] = app_commands.Choice(name=str(value), value=value)
+                return await func(**bound.arguments)
+
+            def _normalize_annotation(annotation):
+                if _is_choice_annotation(annotation):
+                    return str
+                origin = get_origin(annotation)
+                if origin is None:
+                    return annotation
+                args = get_args(annotation)
+                if not args:
+                    return annotation
+                if origin is list or origin is tuple or origin is set:
+                    normalized_args = tuple(_normalize_annotation(arg) for arg in args)
+                    try:
+                        return origin[normalized_args]
+                    except Exception:
+                        return annotation
+                if origin is Union:
+                    non_none = [arg for arg in args if arg is not type(None)]
+                    if non_none:
+                        return _normalize_annotation(non_none[0])
+                normalized_args = tuple(_normalize_annotation(arg) for arg in args)
+                try:
+                    return origin[normalized_args]
+                except Exception:
+                    return annotation
+
+            sig = inspect.signature(func)
+            params = list(sig.parameters.values())
+            if params:
+                params = params[1:]
+            normalized_params = []
+            for param in params:
+                normalized_params.append(
+                    param.replace(annotation=_normalize_annotation(param.annotation))
+                )
+            ctx_param = inspect.Parameter(
+                "ctx",
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=discord.ApplicationContext
+            )
+            wrapper.__signature__ = sig.replace(parameters=[ctx_param] + normalized_params)
+
+            annotations = dict(getattr(func, "__annotations__", {}))
+            if annotations:
+                normalized = {}
+                for key, value in annotations.items():
+                    if key == list(sig.parameters.keys())[0]:
+                        continue
+                    normalized[key] = _normalize_annotation(value)
+                for param, _ in getattr(func, "_kilo_choices", []):
+                    normalized[param] = str
+                wrapper.__annotations__ = normalized
+
+            for param, choices in getattr(func, "_kilo_choices", []):
+                wrapper = discord.option(param, choices=choices)(wrapper)
+            for param, ac in getattr(func, "_kilo_autocomplete", []):
+                async def _ac(ctx, _ac_func=ac):
+                    return await _ac_func(ctx, str(ctx.value or ""))
+
+                wrapper = discord.option(param, autocomplete=_ac)(wrapper)
+
+            return self._bot.slash_command(name=cmd_name, description=cmd_desc)(wrapper)
+
+        return decorator
+
+    async def sync(self):
+        return await self._bot.sync_commands()
+
+
 TEXT_LANG_CHOICES = [
-    app_commands.Choice(name="繁體中文", value="繁體中文"),
-    app_commands.Choice(name="簡體中文", value="簡體中文"),
-    app_commands.Choice(name="English", value="English"),
-    app_commands.Choice(name="한국어", value="한국어"),
-    app_commands.Choice(name="日本語", value="日本語"),
-    app_commands.Choice(name="Español", value="Español"),
-    app_commands.Choice(name="Français", value="Français"),
-    app_commands.Choice(name="Deutsch", value="Deutsch"),
+    discord.OptionChoice(name="繁體中文", value="繁體中文"),
+    discord.OptionChoice(name="簡體中文", value="簡體中文"),
+    discord.OptionChoice(name="English", value="English"),
+    discord.OptionChoice(name="한국어", value="한국어"),
+    discord.OptionChoice(name="日本語", value="日本語"),
+    discord.OptionChoice(name="Español", value="Español"),
+    discord.OptionChoice(name="Français", value="Français"),
+    discord.OptionChoice(name="Deutsch", value="Deutsch"),
 ]
 
 VOICE_LANG_CHOICES = [
-    app_commands.Choice(name="繁體中文 (zho_Hant)", value="zho_Hant"),
-    app_commands.Choice(name="簡體中文 (zho_Hans)", value="zho_Hans"),
-    app_commands.Choice(name="English (eng_Latn)", value="eng_Latn"),
-    app_commands.Choice(name="한국어 (kor_Hang)", value="kor_Hang"),
-    app_commands.Choice(name="日本語 (jpn_Jpan)", value="jpn_Jpan"),
-    app_commands.Choice(name="Español (spa_Latn)", value="spa_Latn"),
-    app_commands.Choice(name="Français (fra_Latn)", value="fra_Latn"),
-    app_commands.Choice(name="Deutsch (deu_Latn)", value="deu_Latn"),
+    discord.OptionChoice(name="繁體中文 (zho_Hant)", value="zho_Hant"),
+    discord.OptionChoice(name="簡體中文 (zho_Hans)", value="zho_Hans"),
+    discord.OptionChoice(name="English (eng_Latn)", value="eng_Latn"),
+    discord.OptionChoice(name="한국어 (kor_Hang)", value="kor_Hang"),
+    discord.OptionChoice(name="日本語 (jpn_Jpan)", value="jpn_Jpan"),
+    discord.OptionChoice(name="Español (spa_Latn)", value="spa_Latn"),
+    discord.OptionChoice(name="Français (fra_Latn)", value="fra_Latn"),
+    discord.OptionChoice(name="Deutsch (deu_Latn)", value="deu_Latn"),
 ]
 
 TEXT_LANG_TO_NLLB = {
@@ -210,6 +375,14 @@ def load_config():
                     "timezone": "Asia/Taipei",
                     "last_sent_date": ""
                 })
+                data.setdefault("todo_reminder", {
+                    "enabled": False,
+                    "content": "",
+                    "time": "",
+                    "channel_id": 0,
+                    "timezone": "Asia/Taipei",
+                    "last_sent_date": ""
+                })
                 data.setdefault("voice_default", {
                     "sample_id": env_sample_id
                 })
@@ -304,6 +477,14 @@ def load_config():
             "timezone": "Asia/Taipei",
             "last_sent_date": ""
         },
+        "todo_reminder": {
+            "enabled": False,
+            "content": "",
+            "time": "",
+            "channel_id": 0,
+            "timezone": "Asia/Taipei",
+            "last_sent_date": ""
+        },
         "voice_default": {
             "sample_id": env_sample_id
         },
@@ -357,6 +538,8 @@ voice_profiles = load_voice_profiles()
 song_history = []
 
 voice_channel_id = None
+voice_listen_task = None
+voice_active_sink = None
 
 def get_voice_listen_config():
     cfg = config.get("voice_listen", {}) or {}
@@ -552,7 +735,10 @@ async def transcribe_pcm(raw_pcm: bytes) -> str:
     if not raw_pcm or not stt_url:
         return ""
     try:
-        wav_bytes = _write_wav_bytes(raw_pcm, VOICE_SAMPLE_RATE, VOICE_CHANNELS, VOICE_SAMPLE_WIDTH)
+        if raw_pcm[:4] == b"RIFF" and raw_pcm[8:12] == b"WAVE":
+            wav_bytes = raw_pcm
+        else:
+            wav_bytes = _write_wav_bytes(raw_pcm, VOICE_SAMPLE_RATE, VOICE_CHANNELS, VOICE_SAMPLE_WIDTH)
         attempts = max(1, STT_RETRY_COUNT)
         for attempt in range(1, attempts + 1):
             form = aiohttp.FormData()
@@ -594,6 +780,33 @@ async def transcribe_pcm(raw_pcm: bytes) -> str:
     except Exception:
         return ""
     return ""
+
+
+async def stt_health_check() -> tuple[bool, str]:
+    stt_cfg = get_stt_config()
+    stt_url = stt_cfg.get("url", "")
+    if not stt_url:
+        return False, "STT URL 未設定"
+    headers = {}
+    token = stt_cfg.get("token", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    endpoints = ["/health", "/docs", "/openapi.json"]
+    async with aiohttp.ClientSession() as session:
+        for path in endpoints:
+            try:
+                async with session.get(
+                    f"{stt_url}{path}",
+                    headers=headers,
+                    timeout=min(6, stt_cfg.get("timeout", STT_TIMEOUT))
+                ) as resp:
+                    if resp.status < 400:
+                        return True, f"HTTP {resp.status} {path}"
+                    text = await resp.text()
+                    last_error = f"HTTP {resp.status} {path}: {text[:120]}"
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+    return False, last_error
 
 async def handle_voice_transcript(text: str, author: Optional[discord.User], reply_channel_id: int, from_name_trigger: bool = False):
     if not text:
@@ -905,6 +1118,127 @@ def _parse_channel_id(raw: str) -> Optional[int]:
         return int(digits[0])
     except Exception:
         return None
+
+
+async def _start_voice_listen(voice_channel_id: int, reply_channel_id: int):
+    global voice_listen_task, voice_active_sink
+    if not voice_channel_id or not reply_channel_id:
+        return
+    if client.voice_client is None or not client.voice_client.is_connected():
+        channel = client.get_channel(voice_channel_id)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(voice_channel_id)
+            except Exception:
+                channel = None
+        if channel is None or not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            return
+        if client.voice_client:
+            try:
+                await client.voice_client.disconnect(force=True)
+            except Exception:
+                pass
+        client.voice_client = await channel.connect()
+
+    if voice_listen_task:
+        voice_listen_task.cancel()
+        voice_listen_task = None
+    voice_listen_task = client.loop.create_task(_voice_listen_worker(reply_channel_id))
+
+    if voice_active_sink:
+        try:
+            client.voice_client.stop_recording()
+        except Exception:
+            pass
+    sink = sinks.WaveSink()
+    voice_active_sink = sink
+    client.voice_client.start_recording(
+        sink,
+        _voice_recording_done_callback,
+        reply_channel_id
+    )
+
+
+async def _stop_voice_listen():
+    global voice_listen_task, voice_active_sink
+    if voice_listen_task:
+        voice_listen_task.cancel()
+        voice_listen_task = None
+    if client.voice_client and client.voice_client.is_recording():
+        try:
+            client.voice_client.stop_recording()
+        except Exception:
+            pass
+    voice_active_sink = None
+
+
+def _voice_recording_done_callback(sink: sinks.WaveSink, reply_channel_id: int):
+    try:
+        for user_id, audio in (sink.audio_data or {}).items():
+            if not audio or not getattr(audio, "file", None):
+                continue
+            try:
+                audio.file.seek(0)
+                raw_pcm = audio.file.read()
+                if not raw_pcm:
+                    continue
+                asyncio.run_coroutine_threadsafe(
+                    _handle_voice_pcm(raw_pcm, user_id, reply_channel_id),
+                    client.loop
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+async def _handle_voice_pcm(raw_pcm: bytes, user_id: int, reply_channel_id: int):
+    if not raw_pcm:
+        return
+    text = await transcribe_pcm(raw_pcm)
+    if not text:
+        return
+    author = client.get_user(int(user_id)) if user_id else None
+    cfg = get_voice_listen_config()
+    triggered = False
+    if cfg.get("name_trigger_enabled"):
+        triggered = _is_name_triggered(text) or _contains_trigger(text, cfg.get("name_triggers", []))
+    await handle_voice_transcript(text, author, reply_channel_id, from_name_trigger=triggered)
+
+
+async def _voice_listen_worker(reply_channel_id: int):
+    while True:
+        await asyncio.sleep(VOICE_SILENCE_SECONDS)
+        if client.voice_client is None or not client.voice_client.is_connected():
+            return
+        if client.voice_client.is_recording():
+            try:
+                client.voice_client.stop_recording()
+            except Exception:
+                pass
+        sink = sinks.WaveSink()
+        global voice_active_sink
+        voice_active_sink = sink
+        client.voice_client.start_recording(
+            sink,
+            _voice_recording_done_callback,
+            reply_channel_id
+        )
+
+
+async def _ensure_voice_listen_on_ready():
+    await client.wait_until_ready()
+    cfg = get_voice_listen_config()
+    if not cfg.get("enabled"):
+        return
+    voice_id = int(cfg.get("voice_channel_id", 0) or 0)
+    reply_id = int(cfg.get("reply_channel_id", 0) or 0)
+    if not voice_id or not reply_id:
+        return
+    try:
+        await _start_voice_listen(voice_id, reply_id)
+    except Exception as e:
+        print(f"[voice] auto-start failed: {type(e).__name__}: {e}")
 
 # ───────── 語音設定/呼叫 HF XTTS ─────────
 def get_voice_profile(user_id: int) -> dict:
@@ -1413,7 +1747,7 @@ async def send_voice_response(channel: discord.abc.Messageable, text: str, profi
     provider = _resolve_voice_provider(profile)
     if provider in {"tonyassi", "hasan", "hasanbasbunar", "quinoad"} or profile.get("use_tonyassi") or os.environ.get("USE_TONYASSI_TTS", "").strip():
         if not _resolve_sample_url(profile):
-            await channel.send("⚠️ 尚未設定 sample_url 或 VOICE_SAMPLE_BASE_URL。請使用 /voice action:set 設定 sample_url。")
+            await channel.send("⚠️ 尚未設定 sample_url 或 VOICE_SAMPLE_BASE_URL。請使用 /set_voice 設定 sample_url。")
             return
 
     result = await request_tts_from_hf(text=text, profile=profile, target_lang=target_lang)
@@ -1513,26 +1847,27 @@ intents.message_content = True
 intents.voice_states = True
 intents.members = bool(os.environ.get("DISCORD_ENABLE_MEMBERS_INTENT", ""))
 
-class MyClient(discord.Client):
+class MyClient(discord.Bot):
     def __init__(self):
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        self.tree = _CommandTreeCompat(self)
         self.voice_client: Optional[discord.VoiceClient] = None
 
     async def setup_hook(self):
-        # 自動同步斜線指令
-        await self.tree.sync()
         # 啟動超時檢查背景任務
         self.loop.create_task(timeout_checker())
         # 啟動每日天氣提醒背景任務
         self.loop.create_task(weather_reminder_checker())
         # 啟動每日三餐提醒背景任務
         self.loop.create_task(meal_reminder_checker())
+        # 啟動每日待辦提醒背景任務
+        self.loop.create_task(todo_reminder_checker())
         # 啟動每日總結背景任務
         self.loop.create_task(daily_summary_checker())
         # 啟動長期記憶載入任務（從 GitHub summary）
         self.loop.create_task(memory_sync_worker())
-        # 語音接收已移除，不啟動語音片段檢查任務
+        # 語音接收（若已啟用，啟動語音偵測）
+        self.loop.create_task(_ensure_voice_listen_on_ready())
 
 client = MyClient()
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
@@ -1863,6 +2198,34 @@ async def fetch_weather_summary(location: str):
         )
     except Exception as e:
         return f"❌ 無法取得天氣資料：{str(e)}"
+
+
+async def _send_weather_reminder(channel, location: str) -> str:
+    raw_weather = await fetch_weather_summary(location)
+    final_text = await build_personalized_weather_text(location, raw_weather, channel_id=channel.id)
+    await channel.send(final_text)
+    add_to_history(channel.id, "assistant", final_text)
+    return final_text
+
+
+async def _send_meal_reminder(channel, location: str, meal_key: str, update_last_sent: bool = False) -> str:
+    suggestion = await generate_dinner_suggestion(location, channel_id=channel.id)
+    prefix = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}.get(meal_key, "餐點")
+    final_text = f"🍽️ {prefix}提醒：{suggestion}"
+    await channel.send(final_text)
+    add_to_history(channel.id, "assistant", final_text)
+    if update_last_sent:
+        reminder = config.get("meal_reminder", {})
+        last_sent = reminder.get("last_sent")
+        if not isinstance(last_sent, dict):
+            last_sent = {}
+        tz_name = str(reminder.get("timezone", "Asia/Taipei")).strip() or "Asia/Taipei"
+        today = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+        last_sent[meal_key] = today
+        reminder["last_sent"] = last_sent
+        config["meal_reminder"] = reminder
+        save_config(config)
+    return final_text
 
 def is_valid_hhmm(time_str: str):
     try:
@@ -2240,9 +2603,9 @@ async def weather_reminder_checker():
                 continue
 
         try:
-            raw_weather = await fetch_weather_summary(location)
-            final_text = await build_personalized_weather_text(location, raw_weather, channel_id=channel_id)
-            await channel.send(final_text)
+            final_text = await _send_weather_reminder(channel, location)
+            if not final_text:
+                continue
             config.setdefault("weather_reminder", {})["last_sent_date"] = today
             save_config(config)
         except:
@@ -2305,12 +2668,66 @@ async def meal_reminder_checker():
                 continue
 
         try:
-            suggestion = await generate_dinner_suggestion(location, channel_id=channel_id)
-            prefix = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}.get(target_meal, "餐點")
-            await channel.send(f"🍽️ {prefix}提醒：{suggestion}")
+            sent = await _send_meal_reminder(channel, location, target_meal, update_last_sent=True)
+            if not sent:
+                continue
             last_sent[target_meal] = today
             reminder["last_sent"] = last_sent
             config["meal_reminder"] = reminder
+            save_config(config)
+        except:
+            pass
+
+
+async def todo_reminder_checker():
+    """每天定時推送待辦事項提醒到指定頻道。"""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(20)
+
+        reminder = config.get("todo_reminder", {})
+        if not reminder.get("enabled", False):
+            continue
+
+        content = str(reminder.get("content", "")).strip()
+        remind_time = str(reminder.get("time", "")).strip()
+        tz_name = str(reminder.get("timezone", "")).strip()
+        channel_id = int(reminder.get("channel_id", 0) or 0)
+
+        if not content or not remind_time or not tz_name or channel_id <= 0:
+            continue
+        if not is_valid_hhmm(remind_time) or not is_valid_timezone(tz_name):
+            continue
+
+        now_local = datetime.now(ZoneInfo(tz_name))
+        if now_local.strftime("%H:%M") != remind_time:
+            continue
+
+        today = now_local.strftime("%Y-%m-%d")
+        if reminder.get("last_sent_date") == today:
+            continue
+
+        channel = client.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except:
+                continue
+
+        try:
+            prompt = (
+                "你要用角色口氣提醒使用者今天的待辦事項。"
+                "請以親切自然的方式開場，並列出待辦清單。"
+                "回覆不要過長，但要清楚。"
+            )
+            reply = await call_api(
+                channel.id,
+                user_text=f"今日待辦清單：\n{content}",
+                special_instruction=prompt
+            )
+            await channel.send(reply)
+            add_to_history(channel.id, "assistant", reply)
+            config.setdefault("todo_reminder", {})["last_sent_date"] = today
             save_config(config)
         except:
             pass
@@ -2482,6 +2899,74 @@ async def reroll(interaction: discord.Interaction):
         await interaction.followup.send(reply)
         await maybe_send_voice(interaction.channel, reply, author=interaction.user)
         add_to_history(interaction.channel_id, "assistant", reply)
+
+
+@client.tree.command(name="reroll_weather", description="重新生成今日天氣提醒")
+async def reroll_weather(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    reminder = config.get("weather_reminder", {})
+    if not reminder.get("enabled", False):
+        await interaction.followup.send("⚠️ 天氣提醒尚未啟用。", ephemeral=True)
+        return
+    location = str(reminder.get("location", "")).strip()
+    channel_id = int(reminder.get("channel_id", 0) or 0)
+    if not location or channel_id <= 0:
+        await interaction.followup.send("⚠️ 天氣提醒設定不完整，請先用 /set_weather_reminder 設定。", ephemeral=True)
+        return
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except Exception:
+            await interaction.followup.send("⚠️ 找不到天氣提醒頻道，或 Bot 無權限。", ephemeral=True)
+            return
+    try:
+        await _send_weather_reminder(channel, location)
+        await interaction.followup.send("✅ 已重新推送天氣提醒。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ 天氣提醒重送失敗：{type(e).__name__}: {e}", ephemeral=True)
+
+
+@client.tree.command(name="reroll_meal", description="重新生成餐點提醒（早餐/午餐/晚餐）")
+@app_commands.choices(
+    meal=[
+        app_commands.Choice(name="breakfast", value="breakfast"),
+        app_commands.Choice(name="lunch", value="lunch"),
+        app_commands.Choice(name="dinner", value="dinner"),
+    ]
+)
+async def reroll_meal(
+    interaction: discord.Interaction,
+    meal: app_commands.Choice[str]
+):
+    if not is_owner(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    reminder = config.get("meal_reminder", {})
+    if not reminder.get("enabled", False):
+        await interaction.followup.send("⚠️ 三餐提醒尚未啟用。", ephemeral=True)
+        return
+    location = str(reminder.get("location", "")) or str(config.get("dinner_location", ""))
+    location = location.strip()
+    channel_id = int(reminder.get("channel_id", 0) or 0)
+    if not location or channel_id <= 0:
+        await interaction.followup.send("⚠️ 三餐提醒設定不完整，請先用 /set_remind 設定。", ephemeral=True)
+        return
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except Exception:
+            await interaction.followup.send("⚠️ 找不到三餐提醒頻道，或 Bot 無權限。", ephemeral=True)
+            return
+    try:
+        await _send_meal_reminder(channel, location, meal.value, update_last_sent=False)
+        label = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}.get(meal.value, meal.value)
+        await interaction.followup.send(f"✅ 已重新推送 {label} 提醒。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ 餐點提醒重送失敗：{type(e).__name__}: {e}", ephemeral=True)
 
 
 @client.tree.command(name="config", description="查看機器人設定（可指定分類/項目）")
@@ -2675,51 +3160,49 @@ async def sync(interaction: discord.Interaction):
 # 自動補完模型清單
 async def model_autocomplete(interaction: discord.Interaction, current: str):
     models = await fetch_models()
-    return [app_commands.Choice(name=m, value=m) for m in models if current.lower() in m.lower()][:25]
-
-# /api 指令用：只有 action=model 時才顯示模型清單
-async def api_value_autocomplete(interaction: discord.Interaction, current: str):
-    try:
-        action = getattr(interaction.namespace, "action", "")
-    except Exception:
-        action = ""
-    if action == "model":
-        return await model_autocomplete(interaction, current)
-    return []
+    keyword = str(current or "").lower()
+    return [discord.OptionChoice(name=m, value=m) for m in models if keyword in m.lower()][:25]
 
 @client.tree.command(name="set_api", description="設定 API URL / Key / 模型")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="url", value="url"),
-        app_commands.Choice(name="key", value="key"),
-        app_commands.Choice(name="model", value="model")
-    ]
-)
-@app_commands.autocomplete(value=api_value_autocomplete)
 async def api(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
-    value: str
+    url: Optional[str] = None,
+    key: Optional[str] = None,
+    model: Optional[str] = None
 ):
-    if not is_owner(interaction): return
-
-    if action.value == "url":
-        config["api_url"] = value
-        save_config(config)
-        await interaction.response.send_message(f"✅ API URL 已更新：`{value}`", ephemeral=True)
+    if not is_owner(interaction):
         return
 
-    if action.value == "key":
-        config["api_key"] = value
-        save_config(config)
-        await interaction.response.send_message("✅ API Key 已更新。", ephemeral=True)
+    if not url and not key and not model:
+        await interaction.response.send_message("⚠️ 請至少提供 url/key/model 其中一項。", ephemeral=True)
         return
 
-    if action.value == "model":
-        config["model"] = value
-        save_config(config)
-        await interaction.response.send_message(f"✅ 模型已切換為：`{value}`", ephemeral=True)
+    updated = []
+    if url:
+        config["api_url"] = url
+        updated.append(f"URL：`{url}`")
+    if key:
+        config["api_key"] = key
+        updated.append("Key：已更新")
+    if model:
+        config["model"] = model
+        updated.append(f"模型：`{model}`")
+
+    save_config(config)
+    await interaction.response.send_message("✅ API 設定已更新：" + "、".join(updated), ephemeral=True)
+
+
+@client.tree.command(name="list_models", description="列出可用模型清單")
+async def list_models(interaction: discord.Interaction):
+    if not is_owner(interaction):
         return
+    await interaction.response.defer(ephemeral=True)
+    models = await fetch_models()
+    if not models:
+        await interaction.followup.send("⚠️ 無法取得模型清單，請確認 API URL/Key。", ephemeral=True)
+        return
+    preview = "\n".join(models[:50])
+    await interaction.followup.send(f"✅ 取得模型 {len(models)} 筆：\n```\n{preview}\n```", ephemeral=True)
 
 @client.tree.command(name="set_char", description="設定角色/Owner/回應文風")
 async def set_char(
@@ -2807,29 +3290,25 @@ async def _chime_channel_autocomplete(
 
 
 @client.tree.command(name="set_chime_channels", description="新增/移除/清空可插嘴/破冰頻道")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="add", value="add"),
-        app_commands.Choice(name="remove", value="remove"),
-        app_commands.Choice(name="clear", value="clear"),
-    ]
-)
 @app_commands.autocomplete(channel_id=_chime_channel_autocomplete)
 async def set_chime_channels(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    add_channel_id: Optional[str] = None,
+    remove_channel_id: Optional[str] = None,
+    clear: Optional[bool] = None,
     channel_id: Optional[str] = None,
 ):
     if not is_owner(interaction):
         return
 
-    if action.value == "clear":
+    if clear:
         config["chime_in_channels"] = []
         save_config(config)
         await interaction.response.send_message("✅ 已清空可插嘴/破冰頻道清單（不限）。", ephemeral=True)
         return
 
-    parsed_channel_id = _parse_channel_id(str(channel_id))
+    target_raw = add_channel_id or remove_channel_id or channel_id
+    parsed_channel_id = _parse_channel_id(str(target_raw))
     if parsed_channel_id is None:
         await interaction.response.send_message("⚠️ 請輸入有效頻道 ID（數字或 #頻道）。", ephemeral=True)
         return
@@ -2845,7 +3324,7 @@ async def set_chime_channels(
     if not isinstance(chime_channels, list):
         chime_channels = []
 
-    if action.value == "add":
+    if add_channel_id or (target_raw and not remove_channel_id):
         if int(parsed_channel_id) not in [int(c) for c in chime_channels]:
             chime_channels.append(int(parsed_channel_id))
             config["chime_in_channels"] = chime_channels
@@ -2854,13 +3333,15 @@ async def set_chime_channels(
         await interaction.response.send_message(f"✅ 已加入可插嘴/破冰頻道：`{label}`", ephemeral=True)
         return
 
-    if action.value == "remove":
+    if remove_channel_id:
         filtered = [int(c) for c in chime_channels if int(c) != int(parsed_channel_id)]
         config["chime_in_channels"] = filtered
         save_config(config)
         label = f"{channel.name} ({parsed_channel_id})" if channel else str(parsed_channel_id)
         await interaction.response.send_message(f"✅ 已移除可插嘴/破冰頻道：`{label}`", ephemeral=True)
         return
+
+    await interaction.response.send_message("⚠️ 請提供 add_channel_id/remove_channel_id 或 clear=true。", ephemeral=True)
 
 
 @client.tree.command(name="set_chime_rate", description="設定插嘴觸發機率 (0~1)")
@@ -2894,15 +3375,9 @@ async def set_chime_retries(
 
 
 @client.tree.command(name="set_weather_reminder", description="設定/關閉每日天氣提醒")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set", value="set"),
-        app_commands.Choice(name="clear", value="clear"),
-    ]
-)
 async def set_weather_reminder(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    enabled: Optional[bool] = None,
     location: Optional[str] = None,
     time_str: Optional[str] = None,
     channel_id: Optional[str] = None,
@@ -2911,7 +3386,7 @@ async def set_weather_reminder(
     if not is_owner(interaction):
         return
 
-    if action.value == "clear":
+    if enabled is False:
         config["weather_reminder"] = {
             "enabled": False,
             "location": "",
@@ -2967,15 +3442,9 @@ async def set_weather_reminder(
     )
 
 @client.tree.command(name="set_remind", description="設定/關閉每日三餐提醒與推薦")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set", value="set"),
-        app_commands.Choice(name="clear", value="clear"),
-    ]
-)
 async def set_remind(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    enabled: Optional[bool] = None,
     location: Optional[str] = None,
     breakfast_time: Optional[str] = None,
     lunch_time: Optional[str] = None,
@@ -2986,7 +3455,7 @@ async def set_remind(
     if not is_owner(interaction):
         return
 
-    if action.value == "clear":
+    if enabled is False:
         config["meal_reminder"] = {
             "enabled": False,
             "location": "",
@@ -3039,6 +3508,84 @@ async def set_remind(
         ephemeral=True
     )
 
+
+@client.tree.command(name="set_todo_reminder", description="設定/關閉每日待辦事項提醒")
+async def set_todo_reminder(
+    interaction: discord.Interaction,
+    enabled: Optional[bool] = None,
+    content: Optional[str] = None,
+    time_str: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    tz_name: Optional[str] = None,
+):
+    if not is_owner(interaction):
+        return
+
+    if enabled is False:
+        config["todo_reminder"] = {
+            "enabled": False,
+            "content": "",
+            "time": "",
+            "channel_id": 0,
+            "timezone": "Asia/Taipei",
+            "last_sent_date": ""
+        }
+        save_config(config)
+        await interaction.response.send_message("✅ 已關閉每日待辦事項提醒。", ephemeral=True)
+        return
+
+    if not content or not time_str or not channel_id or not tz_name:
+        await interaction.response.send_message(
+            "⚠️ 請提供 content、time、channel_id、tz_name。",
+            ephemeral=True
+        )
+        return
+
+    if not is_valid_hhmm(time_str):
+        await interaction.response.send_message("⚠️ 時間格式錯誤，請使用 HH:MM（24 小時制），例如 07:30。", ephemeral=True)
+        return
+
+    if not is_valid_timezone(tz_name):
+        await interaction.response.send_message("⚠️ 時區名稱錯誤，例如 Asia/Taipei。", ephemeral=True)
+        return
+
+    parsed_channel_id = _parse_channel_id(str(channel_id))
+    if parsed_channel_id is None:
+        await interaction.response.send_message("⚠️ 頻道 ID 格式錯誤，請輸入數字或 #頻道。", ephemeral=True)
+        return
+
+    channel = client.get_channel(parsed_channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(parsed_channel_id)
+        except:
+            await interaction.response.send_message("⚠️ 找不到該頻道 ID，或 Bot 沒有權限存取該頻道。", ephemeral=True)
+            return
+
+    cleaned = "\n".join([line.strip() for line in str(content).splitlines() if line.strip()])
+    if not cleaned:
+        await interaction.response.send_message("⚠️ 待辦內容不可為空。", ephemeral=True)
+        return
+
+    config["todo_reminder"] = {
+        "enabled": True,
+        "content": cleaned,
+        "time": time_str.strip(),
+        "channel_id": int(channel.id),
+        "timezone": tz_name.strip(),
+        "last_sent_date": ""
+    }
+    save_config(config)
+    await interaction.response.send_message(
+        "✅ 已設定待辦提醒：\n"
+        f"- 時間：`{time_str}`\n"
+        f"- 時區：`{tz_name}`\n"
+        f"- 頻道：`{channel.id}`\n"
+        "- 內容：\n"
+        f"```\n{cleaned}\n```",
+        ephemeral=True
+    )
+
 @client.tree.command(name="set_user", description="設定主要使用者外觀/個性/職業/所在地點")
 async def set_profile(
     interaction: discord.Interaction,
@@ -3075,24 +3622,17 @@ async def set_profile(
     await interaction.response.send_message("✅ 使用者設定已更新！", ephemeral=True)
 
 @client.tree.command(name="set_summary", description="設定/開關/立即執行每日總結")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set_time", value="set_time"),
-        app_commands.Choice(name="enable", value="enable"),
-        app_commands.Choice(name="disable", value="disable"),
-        app_commands.Choice(name="run", value="run"),
-    ]
-)
 async def set_summary(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    enabled: Optional[bool] = None,
+    run: Optional[bool] = None,
     time_str: Optional[str] = None,
     tz_name: Optional[str] = None,
 ):
     if not is_owner(interaction):
         return
 
-    if action.value == "set_time":
+    if time_str or tz_name:
         if not time_str or not tz_name:
             await interaction.response.send_message("⚠️ 請提供 time_str 與 tz_name。", ephemeral=True)
             return
@@ -3115,13 +3655,13 @@ async def set_summary(
         )
         return
 
-    if action.value == "enable":
+    if enabled is True:
         config.setdefault("summary_schedule", {})["enabled"] = True
         save_config(config)
         await interaction.response.send_message("✅ 已開啟每日總結。", ephemeral=True)
         return
 
-    if action.value == "disable":
+    if enabled is False:
         config.setdefault("summary_schedule", {})["enabled"] = False
         save_config(config)
         await interaction.response.send_message(
@@ -3130,7 +3670,7 @@ async def set_summary(
         )
         return
 
-    if action.value == "run":
+    if run:
         await interaction.response.defer(ephemeral=True)
         now_local = datetime.now(_get_summary_timezone())
         today = now_local.strftime("%Y-%m-%d")
@@ -3142,19 +3682,15 @@ async def set_summary(
         await interaction.followup.send(msg, ephemeral=True)
         return
 
+    await interaction.response.send_message("⚠️ 請提供 enabled、run 或 time_str/tz_name。", ephemeral=True)
+
 
 @client.tree.command(name="set_voice", description="語音設定與手動觸發")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set", value="set"),
-        app_commands.Choice(name="show", value="show"),
-        app_commands.Choice(name="clear", value="clear")
-    ]
-)
 @app_commands.choices(text_lang=TEXT_LANG_CHOICES, voice_lang=VOICE_LANG_CHOICES)
 async def voice(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    show: Optional[bool] = None,
+    clear: Optional[bool] = None,
     sample_url: Optional[str] = None,
     use_tonyassi: Optional[bool] = None,
     voice_provider: Optional[str] = None,
@@ -3167,7 +3703,31 @@ async def voice(
     await interaction.response.defer(ephemeral=True)
     user_key = str(interaction.user.id)
 
-    if action.value == "set":
+    if clear:
+        if user_key in voice_profiles:
+            voice_profiles.pop(user_key)
+            save_voice_profiles(voice_profiles)
+        await interaction.followup.send("✅ 已清除你的語音設定。", ephemeral=True)
+        return
+
+    if show:
+        profile = get_voice_profile(interaction.user.id)
+        if not profile:
+            await interaction.followup.send("⚠️ 尚未設定語音資料。使用 /set_voice 參數來設定。", ephemeral=True)
+            return
+        masked = {
+            "sample_url": profile.get("sample_url", ""),
+            "use_tonyassi": profile.get("use_tonyassi", False),
+            "voice_provider": profile.get("voice_provider", ""),
+            "example_audio_name": profile.get("example_audio_name", ""),
+            "text_lang": profile.get("text_lang", ""),
+            "voice_lang": profile.get("voice_lang", ""),
+            "enabled": profile.get("enabled", True)
+        }
+        await interaction.followup.send(f"你的語音設定：```json\n{json.dumps(masked, ensure_ascii=False, indent=2)}\n```", ephemeral=True)
+        return
+
+    if any([sample_url, use_tonyassi is not None, voice_provider, example_audio_name, text_lang, voice_lang, enabled is not None, test_text]):
         profile = get_voice_profile(interaction.user.id)
         if sample_url:
             profile["sample_url"] = sample_url.strip()
@@ -3189,38 +3749,12 @@ async def voice(
             await send_voice_response(interaction.channel, test_text, profile, target_lang=None)
         return
 
-    if action.value == "show":
-        profile = get_voice_profile(interaction.user.id)
-        if not profile:
-            await interaction.followup.send("⚠️ 尚未設定語音資料。使用 /voice action:set 來設定。", ephemeral=True)
-            return
-        masked = {
-            "sample_url": profile.get("sample_url", ""),
-            "use_tonyassi": profile.get("use_tonyassi", False),
-            "voice_provider": profile.get("voice_provider", ""),
-            "example_audio_name": profile.get("example_audio_name", ""),
-            "text_lang": profile.get("text_lang", ""),
-            "voice_lang": profile.get("voice_lang", ""),
-            "enabled": profile.get("enabled", True)
-        }
-        await interaction.followup.send(f"你的語音設定：```json\n{json.dumps(masked, ensure_ascii=False, indent=2)}\n```", ephemeral=True)
-        return
-
-    if action.value == "clear":
-        if user_key in voice_profiles:
-            voice_profiles.pop(user_key)
-            save_voice_profiles(voice_profiles)
-        await interaction.followup.send("✅ 已清除你的語音設定。", ephemeral=True)
-        return
+    await interaction.followup.send("⚠️ 請提供 show/clear 或任一語音設定參數。", ephemeral=True)
 
 
 
 @client.tree.command(name="set_forbidden", description="新增/清空禁止清單")
 @app_commands.choices(
-    action=[
-        app_commands.Choice(name="add", value="add"),
-        app_commands.Choice(name="clear", value="clear"),
-    ],
     category=[
         app_commands.Choice(name="禁止詞彙", value="forbidden_words"),
         app_commands.Choice(name="禁止出現的食物", value="forbidden_foods"),
@@ -3230,29 +3764,29 @@ async def voice(
 )
 async def set_forbidden(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    add_item: Optional[str] = None,
+    clear: Optional[bool] = None,
     category: Optional[app_commands.Choice[str]] = None,
-    item: Optional[str] = None
 ):
     if not is_owner(interaction):
         return
 
-    if action.value == "add":
-        if category is None or not item:
-            await interaction.response.send_message("⚠️ 請提供 category 與 item。", ephemeral=True)
+    if add_item:
+        if category is None:
+            await interaction.response.send_message("⚠️ 請提供 category。", ephemeral=True)
             return
         key = category.value
         items = config.get(key, [])
         if not isinstance(items, list):
             items = []
-        if item not in items:
-            items.append(item)
+        if add_item not in items:
+            items.append(add_item)
             config[key] = items
             save_config(config)
-        await interaction.response.send_message(f"✅ 已將 `{item}` 加入 `{category.name}` 清單。", ephemeral=True)
+        await interaction.response.send_message(f"✅ 已將 `{add_item}` 加入 `{category.name}` 清單。", ephemeral=True)
         return
 
-    if action.value == "clear":
+    if clear:
         if category is None:
             config["forbidden_words"] = []
             config["forbidden_foods"] = []
@@ -3267,6 +3801,8 @@ async def set_forbidden(
         save_config(config)
         await interaction.response.send_message(f"✅ `{category.name}` 清單已清空。", ephemeral=True)
         return
+
+    await interaction.response.send_message("⚠️ 請提供 add_item 或 clear=true。", ephemeral=True)
 
 async def _timeout_channel_autocomplete(
     interaction: discord.Interaction,
@@ -3294,40 +3830,32 @@ async def _timeout_channel_autocomplete(
 
 
 @client.tree.command(name="set_timeout", description="設定沉默多久(分)後機器人主動開話題")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set_minutes", value="set_minutes"),
-        app_commands.Choice(name="add_channel", value="add_channel"),
-        app_commands.Choice(name="remove_channel", value="remove_channel"),
-        app_commands.Choice(name="clear_channels", value="clear_channels"),
-    ]
-)
 @app_commands.autocomplete(channel_id=_timeout_channel_autocomplete)
 async def set_timeout(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
     minutes: Optional[int] = None,
+    add_channel_id: Optional[str] = None,
+    remove_channel_id: Optional[str] = None,
+    clear_channels: Optional[bool] = None,
     channel_id: Optional[str] = None,
 ):
     if not is_owner(interaction):
         return
 
-    if action.value == "set_minutes":
-        if minutes is None:
-            await interaction.response.send_message("⚠️ 請提供 minutes。", ephemeral=True)
-            return
+    if minutes is not None:
         config["timeout_minutes"] = minutes
         save_config(config)
         await interaction.response.send_message(f"✅ 超時設定為 `{minutes}` 分鐘。", ephemeral=True)
         return
 
-    if action.value == "clear_channels":
+    if clear_channels:
         config["timeout_channels"] = []
         save_config(config)
         await interaction.response.send_message("✅ 已清空 timeout 頻道清單。", ephemeral=True)
         return
 
-    parsed_channel_id = _parse_channel_id(str(channel_id))
+    target_raw = add_channel_id or remove_channel_id or channel_id
+    parsed_channel_id = _parse_channel_id(str(target_raw))
     if parsed_channel_id is None:
         await interaction.response.send_message("⚠️ 請輸入有效頻道 ID（數字或 #頻道）。", ephemeral=True)
         return
@@ -3343,7 +3871,7 @@ async def set_timeout(
     if not isinstance(timeout_channels, list):
         timeout_channels = []
 
-    if action.value == "add_channel":
+    if add_channel_id or (target_raw and not remove_channel_id):
         if int(parsed_channel_id) not in [int(c) for c in timeout_channels]:
             timeout_channels.append(int(parsed_channel_id))
             config["timeout_channels"] = timeout_channels
@@ -3352,7 +3880,7 @@ async def set_timeout(
         await interaction.response.send_message(f"✅ 已加入 timeout 頻道：`{label}`", ephemeral=True)
         return
 
-    if action.value == "remove_channel":
+    if remove_channel_id:
         filtered = [int(c) for c in timeout_channels if int(c) != int(parsed_channel_id)]
         config["timeout_channels"] = filtered
         save_config(config)
@@ -3360,21 +3888,17 @@ async def set_timeout(
         await interaction.response.send_message(f"✅ 已移除 timeout 頻道：`{label}`", ephemeral=True)
         return
 
+    await interaction.response.send_message("⚠️ 請提供 minutes、add_channel_id/remove_channel_id 或 clear_channels=true。", ephemeral=True)
+
 
 @client.tree.command(name="set_voice_listen", description="語音偵測插嘴設定/進出語音頻道")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="join", value="join"),
-        app_commands.Choice(name="leave", value="leave"),
-        app_commands.Choice(name="status", value="status"),
-    ]
-)
 async def set_voice_listen(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    enabled: Optional[bool] = None,
     voice_channel_id: Optional[str] = None,
     reply_channel_id: Optional[str] = None,
     names: Optional[str] = None,
+    status: Optional[bool] = None,
 ):
     if not is_owner(interaction):
         return
@@ -3383,7 +3907,7 @@ async def set_voice_listen(
 
     cfg = get_voice_listen_config()
 
-    if action.value == "status":
+    if status:
         stt_cfg = get_stt_config()
         await interaction.followup.send(
             "\n".join([
@@ -3399,18 +3923,82 @@ async def set_voice_listen(
         )
         return
 
+    if enabled is False:
+        config["voice_listen"] = {
+            "enabled": False,
+            "voice_channel_id": cfg.get("voice_channel_id", 0),
+            "reply_channel_id": cfg.get("reply_channel_id", 0),
+            "name_triggers": cfg.get("name_triggers", []),
+            "name_trigger_enabled": cfg.get("name_trigger_enabled", False)
+        }
+        save_config(config)
+        await _stop_voice_listen()
+        if client.voice_client:
+            try:
+                await client.voice_client.disconnect(force=True)
+            except Exception:
+                pass
+            client.voice_client = None
+        await interaction.followup.send("✅ 已停用語音偵測並離開語音頻道。", ephemeral=True)
+        return
+
+    if enabled is True:
+        parsed_voice_id = _parse_channel_id(str(voice_channel_id))
+        parsed_reply_id = _parse_channel_id(str(reply_channel_id))
+        if parsed_voice_id is None:
+            await interaction.followup.send("⚠️ 請提供有效語音頻道 ID（數字或 #頻道）。", ephemeral=True)
+            return
+        if parsed_reply_id is None:
+            await interaction.followup.send("⚠️ 請提供有效回覆頻道 ID（數字或 #頻道）。", ephemeral=True)
+            return
+        name_list = cfg.get("name_triggers", [])
+        name_enabled = cfg.get("name_trigger_enabled", False)
+        if names is not None:
+            cleaned = [item.strip() for item in str(names).replace("\n", ",").split(",")]
+            name_list = [item for item in cleaned if item]
+            name_enabled = bool(name_list)
+
+        config["voice_listen"] = {
+            "enabled": True,
+            "voice_channel_id": int(parsed_voice_id),
+            "reply_channel_id": int(parsed_reply_id),
+            "name_triggers": name_list,
+            "name_trigger_enabled": name_enabled
+        }
+        save_config(config)
+
+        try:
+            await _start_voice_listen(int(parsed_voice_id), int(parsed_reply_id))
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ 啟動語音偵測失敗：{type(e).__name__}: {e}",
+                ephemeral=True
+            )
+            return
+
+        stt_cfg = get_stt_config()
+        await interaction.followup.send(
+            "\n".join([
+                "✅ 已啟用語音偵測。",
+                f"🎤 語音頻道 ID：{parsed_voice_id}",
+                f"💬 回覆頻道 ID：{parsed_reply_id}",
+                f"🧷 名字觸發：{name_enabled}",
+                f"🔤 名字清單：{', '.join(name_list) if name_list else '（空）'}",
+                f"🛰️ STT 服務：{stt_cfg.get('url') or '未設定'}",
+                "ℹ️ 可用 /stt_health 進行 STT 連線診斷。"
+            ]),
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send("⚠️ 請提供 enabled=true/false 或 status=true。", ephemeral=True)
+
 
 @client.tree.command(name="set_stt", description="設定/查看 STT 服務（URL/Token/Timeout/Language）")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set", value="set"),
-        app_commands.Choice(name="clear", value="clear"),
-        app_commands.Choice(name="status", value="status"),
-    ]
-)
 async def set_stt(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    show: Optional[bool] = None,
+    clear: Optional[bool] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
     timeout: Optional[float] = None,
@@ -3421,7 +4009,7 @@ async def set_stt(
 
     await interaction.response.defer(ephemeral=True)
 
-    if action.value == "status":
+    if show:
         stt_cfg = get_stt_config()
         await interaction.followup.send(
             "\n".join([
@@ -3434,7 +4022,7 @@ async def set_stt(
         )
         return
 
-    if action.value == "clear":
+    if clear:
         config["stt"] = {
             "url": "",
             "token": "",
@@ -3484,18 +4072,24 @@ async def set_stt(
     )
 
 
+@client.tree.command(name="stt_health", description="檢查 STT 服務連線狀態")
+async def stt_health(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, detail = await stt_health_check()
+    if ok:
+        await interaction.followup.send(f"✅ STT 連線正常：{detail}", ephemeral=True)
+    else:
+        await interaction.followup.send(f"⚠️ STT 連線失敗：{detail}", ephemeral=True)
+
+
 @client.tree.command(name="set_nsfw_guard", description="設定頻道人數限制的 NSFW 防護")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set", value="set"),
-        app_commands.Choice(name="clear", value="clear"),
-        app_commands.Choice(name="status", value="status"),
-    ]
-)
 async def set_nsfw_guard(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    enabled: Optional[bool] = None,
     max_members: Optional[int] = None,
+    status: Optional[bool] = None,
 ):
     if not is_owner(interaction):
         return
@@ -3504,7 +4098,7 @@ async def set_nsfw_guard(
 
     guard = config.get("nsfw_guard", {}) or {}
 
-    if action.value == "status":
+    if status:
         await interaction.followup.send(
             "\n".join([
                 f"✅ 啟用狀態：{guard.get('enabled', False)}",
@@ -3514,7 +4108,7 @@ async def set_nsfw_guard(
         )
         return
 
-    if action.value == "clear":
+    if enabled is False:
         config["nsfw_guard"] = {"enabled": False, "max_members": 0}
         save_config(config)
         await interaction.followup.send("✅ 已關閉 NSFW 防護限制。", ephemeral=True)
@@ -3533,16 +4127,10 @@ async def set_nsfw_guard(
 
 
 @client.tree.command(name="set_github_backup", description="設定 GitHub 備份參數")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set", value="set"),
-        app_commands.Choice(name="clear", value="clear"),
-        app_commands.Choice(name="status", value="status"),
-    ]
-)
 async def set_github_backup(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    show: Optional[bool] = None,
+    clear: Optional[bool] = None,
     repo: Optional[str] = None,
     branch: Optional[str] = None,
     token: Optional[str] = None,
@@ -3555,7 +4143,7 @@ async def set_github_backup(
 
     cfg = config.get("github_backup", {}) or {}
 
-    if action.value == "status":
+    if show:
         await interaction.followup.send(
             "\n".join([
                 f"📦 Repo：{cfg.get('repo') or os.environ.get('GITHUB_REPO', '') or '未設定'}",
@@ -3567,35 +4155,37 @@ async def set_github_backup(
         )
         return
 
-    if action.value == "clear":
+    if clear:
         config["github_backup"] = {"repo": "", "branch": "", "token": "", "path": ""}
         save_config(config)
         await interaction.followup.send("✅ 已清除 GitHub 備份設定，將回退環境變數。", ephemeral=True)
         return
 
-    if not repo:
-        await interaction.followup.send("⚠️ 請提供 repo（例如 owner/repo）。", ephemeral=True)
+    if not repo and not branch and not token and not path:
+        await interaction.followup.send("⚠️ 請至少提供 repo/branch/token/path 其中一項。", ephemeral=True)
         return
 
-    cleaned_repo = str(repo).strip()
-    if "/" not in cleaned_repo:
-        await interaction.followup.send("⚠️ repo 格式應為 owner/repo。", ephemeral=True)
-        return
+    cleaned_repo = cfg.get("repo", "")
+    if repo:
+        cleaned_repo = str(repo).strip()
+        if "/" not in cleaned_repo:
+            await interaction.followup.send("⚠️ repo 格式應為 owner/repo。", ephemeral=True)
+            return
 
     config["github_backup"] = {
         "repo": cleaned_repo,
-        "branch": str(branch or "").strip(),
-        "token": str(token or "").strip(),
-        "path": str(path or "").strip(),
+        "branch": str(branch if branch is not None else cfg.get("branch", "")).strip(),
+        "token": str(token if token is not None else cfg.get("token", "")).strip(),
+        "path": str(path if path is not None else cfg.get("path", "")).strip(),
     }
     save_config(config)
     await interaction.followup.send(
         "\n".join([
             "✅ 已更新 GitHub 備份設定。",
-            f"📦 Repo：`{cleaned_repo}`",
-            f"🌿 Branch：`{branch or '使用環境變數'}`",
-            f"🔐 Token：{'已設定' if token else '未設定'}",
-            f"📁 Path：`{path or '使用環境變數'}`",
+            f"📦 Repo：`{cleaned_repo or '使用環境變數'}`",
+            f"🌿 Branch：`{(branch if branch is not None else '使用環境變數')}`",
+            f"🔐 Token：{'已設定' if (token is not None and token) else '未變更'}",
+            f"📁 Path：`{(path if path is not None else '使用環境變數')}`",
         ]),
         ephemeral=True
     )
@@ -3603,17 +4193,11 @@ async def set_github_backup(
 
 
 @client.tree.command(name="set_memory_sync", description="設定從 GitHub summary 載入長期記憶")
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="set", value="set"),
-        app_commands.Choice(name="clear", value="clear"),
-        app_commands.Choice(name="status", value="status"),
-        app_commands.Choice(name="reload", value="reload"),
-    ]
-)
 async def set_memory_sync(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
+    enabled: Optional[bool] = None,
+    reload: Optional[bool] = None,
+    show: Optional[bool] = None,
     days: Optional[int] = None,
     tz_name: Optional[str] = None,
 ):
@@ -3623,7 +4207,7 @@ async def set_memory_sync(
     await interaction.response.defer(ephemeral=True)
     cfg = config.get("memory_sync", {}) or {}
 
-    if action.value == "status":
+    if show:
         await interaction.followup.send(
             "\n".join([
                 f"✅ 啟用狀態：{cfg.get('enabled', False)}",
@@ -3636,13 +4220,13 @@ async def set_memory_sync(
         )
         return
 
-    if action.value == "clear":
+    if enabled is False:
         config["memory_sync"] = {"enabled": False, "days": 7, "timezone": "Asia/Taipei", "last_loaded_date": ""}
         save_config(config)
         await interaction.followup.send("✅ 已關閉長期記憶載入。", ephemeral=True)
         return
 
-    if action.value == "reload":
+    if reload:
         global long_term_memory
         long_term_memory = await _load_github_summaries()
         tz_val = cfg.get("timezone", "Asia/Taipei")
@@ -3676,17 +4260,6 @@ async def set_memory_sync(
         ]),
         ephemeral=True
     )
-
-    if action.value == "leave":
-        if client.voice_client:
-            try:
-                await client.voice_client.disconnect(force=True)
-            except Exception:
-                pass
-            client.voice_client = None
-        await interaction.followup.send("✅ 已離開語音頻道。", ephemeral=True)
-        return
-
 
 @client.tree.command(name="join_voice_only", description="只加入語音頻道（不啟用語音偵測/回覆）")
 async def join_voice_only(
