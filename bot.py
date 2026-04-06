@@ -1511,7 +1511,7 @@ async def fetch_models():
 intents = discord.Intents.default()
 intents.message_content = True 
 intents.voice_states = True
-intents.members = True
+intents.members = bool(os.environ.get("DISCORD_ENABLE_MEMBERS_INTENT", ""))
 
 class MyClient(discord.Client):
     def __init__(self):
