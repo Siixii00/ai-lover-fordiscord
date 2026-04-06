@@ -354,6 +354,7 @@ channel_last_time = {}
 MAX_HISTORY = 10
 memory_lock = threading.Lock()
 voice_profiles = load_voice_profiles()
+song_history = []
 
 voice_channel_id = None
 
@@ -480,6 +481,38 @@ async def _select_reaction_emoji(text: str) -> str:
     except Exception:
         return ""
 
+def _is_song_request(text: str) -> bool:
+    if not text:
+        return False
+    key = _normalize_text(text)
+    return any(k in key for k in ["推薦歌", "推薦歌曲", "推薦音樂", "推歌", "推音樂"])
+
+def _extract_song_candidates(text: str) -> list[str]:
+    if not text:
+        return []
+    candidates = []
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if "http://" in lower or "https://" in lower:
+            continue
+        if "spotify" in lower or "music.youtube" in lower:
+            continue
+        if stripped[0] in {"-", "•", "*", "1", "2", "3", "4", "5", "6", "7", "8", "9"}:
+            candidates.append(stripped.lstrip("-•*0123456789.、 ").strip())
+            continue
+        if " - " in stripped or " — " in stripped or "：" in stripped:
+            candidates.append(stripped)
+    uniq = []
+    for item in candidates:
+        if item and item not in uniq:
+            uniq.append(item)
+        if len(uniq) >= 20:
+            break
+    return uniq
+
 def _contains_trigger(text: str, triggers: list[str]) -> bool:
     normalized = _normalize_text(text)
     for raw in triggers:
@@ -605,7 +638,8 @@ def save_runtime_state():
         with memory_lock:
             payload = {
                 "global_history": global_history[-MAX_HISTORY:],
-                "channel_last_time": {str(k): v for k, v in channel_last_time.items()}
+                "channel_last_time": {str(k): v for k, v in channel_last_time.items()},
+                "song_history": song_history[-20:]
             }
             with open(MEMORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -614,7 +648,7 @@ def save_runtime_state():
 
 def load_runtime_state():
     """啟動時載入既有對話記憶，避免重啟後全部遺失。"""
-    global global_history, channel_last_time
+    global global_history, channel_last_time, song_history
     if not os.path.exists(MEMORY_FILE):
         return
     try:
@@ -623,6 +657,7 @@ def load_runtime_state():
 
         loaded_history = data.get("global_history", None)
         loaded_last_time = data.get("channel_last_time", {})
+        loaded_song_history = data.get("song_history", [])
 
         if isinstance(loaded_history, list):
             global_history = loaded_history[-MAX_HISTORY:]
@@ -638,9 +673,12 @@ def load_runtime_state():
             int(k): float(v)
             for k, v in loaded_last_time.items()
         }
+        if isinstance(loaded_song_history, list):
+            song_history = [str(x) for x in loaded_song_history if str(x).strip()][:20]
     except:
         global_history = []
         channel_last_time = {}
+        song_history = []
 
 def _get_summary_timezone():
     tz_name = str(config.get("summary_schedule", {}).get("timezone", "Asia/Taipei")).strip()
@@ -1658,6 +1696,18 @@ async def call_api(channel_id, user_text=None, special_instruction=None, author=
         "Content-Type": "application/json"
     }
     system_content = build_system_prompt(channel_id=channel_id, author=author)
+    if user_text and _is_song_request(user_text):
+        recent_songs = "、".join(song_history[-20:]) if song_history else "（無）"
+        system_content += (
+            "\n\n【歌曲推薦規則】"
+            "\n- 請依照對話情緒與語氣挑選歌曲。"
+            "\n- 請避免推薦最近 20 次已推薦的歌曲。"
+            f"\n- 最近 20 次推薦清單：{recent_songs}"
+            "\n- 請輸出 3 首歌，格式為「歌名 - 歌手」。"
+            "\n- 另外輸出 Spotify 與 YouTube Music 的搜尋連結（用歌曲關鍵字即可）。"
+            "\n  Spotify：https://open.spotify.com/search/<關鍵字>"
+            "\n  YouTube Music：https://music.youtube.com/search?q=<關鍵字>"
+        )
     if author:
         profile = get_voice_profile(author.id)
         text_lang = profile.get("text_lang")
@@ -1700,7 +1750,17 @@ async def call_api(channel_id, user_text=None, special_instruction=None, author=
                     return f"❌ API 錯誤 ({resp.status}): {res_text[:100]}"
                 data = await resp.json()
                 content = data["choices"][0]["message"]["content"]
-                return _cleanup_response_text(content)
+                cleaned = _cleanup_response_text(content)
+                if user_text and _is_song_request(user_text):
+                    candidates = _extract_song_candidates(cleaned)
+                    if candidates:
+                        for item in candidates:
+                            if item and item not in song_history:
+                                song_history.append(item)
+                        if len(song_history) > 20:
+                            del song_history[:-20]
+                        save_runtime_state()
+                return cleaned
     except Exception as e:
         return f"❌ 連線失敗: {str(e)}"
 
@@ -2323,6 +2383,12 @@ async def on_message(message):
 
     # 情況 A：被標記 (@Bot) -> 必定回覆
     if client.user in message.mentions:
+        image_attachments = [a for a in message.attachments if _is_image_attachment(a)]
+        if image_attachments:
+            vision_text = await _describe_images_with_vision(image_attachments)
+            if vision_text:
+                await message.reply(f"🖼️ 圖片描述：{vision_text}")
+                return
         if await _should_block_nsfw(message.channel, message.content):
             await message.reply("⚠️ 此頻道人數較多，為避免隱私外洩，無法討論 NSFW 話題。請改用私密頻道。")
             return
