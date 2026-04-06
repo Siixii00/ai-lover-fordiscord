@@ -49,6 +49,8 @@ STT_SPACE_URL = str(os.environ.get("STT_SPACE_URL", "")).strip().rstrip("/")
 STT_API_KEY = str(os.environ.get("STT_API_KEY", "")).strip()
 STT_TIMEOUT = float(os.environ.get("STT_TIMEOUT", "20"))
 STT_LANGUAGE = str(os.environ.get("STT_LANGUAGE", "")).strip()
+STT_RETRY_COUNT = int(os.environ.get("STT_RETRY_COUNT", "2"))
+STT_RETRY_DELAY = float(os.environ.get("STT_RETRY_DELAY", "1.0"))
 
 TEXT_LANG_CHOICES = [
     app_commands.Choice(name="繁體中文", value="繁體中文"),
@@ -156,6 +158,18 @@ def load_config():
                     "timezone": "Asia/Taipei",
                     "last_sent_date": ""
                 })
+                data.setdefault("memory_sync", {
+                    "enabled": False,
+                    "days": 7,
+                    "timezone": "Asia/Taipei",
+                    "last_loaded_date": ""
+                })
+                data.setdefault("github_backup", {
+                    "repo": "",
+                    "branch": "",
+                    "token": "",
+                    "path": ""
+                })
                 data.setdefault("response_style", "")
                 data.setdefault("bot_name", "")
                 data.setdefault("bot_nickname", "")
@@ -206,6 +220,16 @@ def load_config():
                     "name_triggers": [],
                     "name_trigger_enabled": False
                 })
+                data.setdefault("nsfw_guard", {
+                    "enabled": False,
+                    "max_members": 0
+                })
+                data.setdefault("stt", {
+                    "url": "",
+                    "token": "",
+                    "timeout": 0,
+                    "language": ""
+                })
                 if env_sample_id:
                     data["voice_default"]["sample_id"] = env_sample_id
                 return data
@@ -227,6 +251,18 @@ def load_config():
             "time": "",
             "timezone": "Asia/Taipei",
             "last_sent_date": ""
+        },
+        "memory_sync": {
+            "enabled": False,
+            "days": 7,
+            "timezone": "Asia/Taipei",
+            "last_loaded_date": ""
+        },
+        "github_backup": {
+            "repo": "",
+            "branch": "",
+            "token": "",
+            "path": ""
         },
         "response_style": "",
         "bot_name": "",
@@ -277,6 +313,16 @@ def load_config():
             "reply_channel_id": 0,
             "name_triggers": [],
             "name_trigger_enabled": False
+        },
+        "nsfw_guard": {
+            "enabled": False,
+            "max_members": 0
+        },
+        "stt": {
+            "url": "",
+            "token": "",
+            "timeout": 0,
+            "language": ""
         }
     }
 
@@ -321,8 +367,118 @@ def get_voice_listen_config():
         "name_trigger_enabled": bool(cfg.get("name_trigger_enabled", False)),
     }
 
+def get_stt_config():
+    cfg = config.get("stt", {}) or {}
+    url = str(cfg.get("url", "")).strip() or STT_SPACE_URL
+    token = str(cfg.get("token", "")).strip() or STT_API_KEY
+    try:
+        timeout_val = float(cfg.get("timeout", 0) or 0)
+    except Exception:
+        timeout_val = 0
+    timeout = timeout_val if timeout_val > 0 else STT_TIMEOUT
+    language = str(cfg.get("language", "")).strip() or STT_LANGUAGE
+    return {
+        "url": url,
+        "token": token,
+        "timeout": timeout,
+        "language": language,
+    }
+
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", str(text or "")).lower()
+
+def _get_channel_member_count(channel) -> int:
+    try:
+        members = getattr(channel, "members", None)
+        if isinstance(members, list) and members:
+            return len(members)
+    except Exception:
+        pass
+    try:
+        if hasattr(channel, "guild") and channel.guild and channel.guild.member_count:
+            return int(channel.guild.member_count)
+    except Exception:
+        pass
+    return 0
+
+async def _classify_nsfw(text: str) -> bool:
+    if not text:
+        return False
+    if not config.get("api_key") or not config.get("api_url"):
+        return False
+    endpoint = f"{config['api_url'].rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config['api_key']}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "model": config["model"],
+        "messages": [
+            {"role": "system", "content": (
+                "你是一個內容分類器。請判斷輸入是否屬於 NSFW（成人/情色/露骨性內容）。"
+                "只回覆 JSON：{\"nsfw\": true/false}"
+            )},
+            {"role": "user", "content": text}
+        ],
+        "response_format": {"type": "json_object"}
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, headers=headers, json=body, timeout=12) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+                result = json.loads(data["choices"][0]["message"]["content"])
+                return bool(result.get("nsfw", False))
+    except Exception:
+        return False
+
+async def _should_block_nsfw(channel, text: str) -> bool:
+    guard = config.get("nsfw_guard", {}) or {}
+    if not guard.get("enabled", False):
+        return False
+    max_members = int(guard.get("max_members", 0) or 0)
+    if max_members <= 0:
+        return False
+    member_count = _get_channel_member_count(channel)
+    if member_count <= max_members:
+        return False
+    return await _classify_nsfw(text)
+
+async def _select_reaction_emoji(text: str) -> str:
+    if not text:
+        return ""
+    if not config.get("api_key") or not config.get("api_url"):
+        return ""
+    endpoint = f"{config['api_url'].rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config['api_key']}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "model": config["model"],
+        "messages": [
+            {"role": "system", "content": (
+                "你是一個 Discord 反應選擇器。"
+                "請根據訊息語氣挑選 1 個適合的預設小黃臉表情符號，"
+                "若不需要反應就回空字串。"
+                "只回覆 JSON：{\"emoji\": \"\" 或 \"🙂\"}"
+            )},
+            {"role": "user", "content": text}
+        ],
+        "response_format": {"type": "json_object"}
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, headers=headers, json=body, timeout=10) as resp:
+                if resp.status != 200:
+                    return ""
+                data = await resp.json()
+                result = json.loads(data["choices"][0]["message"]["content"])
+                emoji = str(result.get("emoji", "")).strip()
+                return emoji
+    except Exception:
+        return ""
 
 def _contains_trigger(text: str, triggers: list[str]) -> bool:
     normalized = _normalize_text(text)
@@ -358,36 +514,53 @@ def _write_wav_bytes(raw_pcm: bytes, sample_rate: int, channels: int, sample_wid
     return buf.getvalue()
 
 async def transcribe_pcm(raw_pcm: bytes) -> str:
-    if not raw_pcm or not STT_SPACE_URL:
+    stt_cfg = get_stt_config()
+    stt_url = stt_cfg.get("url", "")
+    if not raw_pcm or not stt_url:
         return ""
     try:
         wav_bytes = _write_wav_bytes(raw_pcm, VOICE_SAMPLE_RATE, VOICE_CHANNELS, VOICE_SAMPLE_WIDTH)
-        form = aiohttp.FormData()
-        form.add_field(
-            "audio",
-            wav_bytes,
-            filename="audio.wav",
-            content_type="audio/wav"
-        )
-        if STT_LANGUAGE:
-            form.add_field("language", STT_LANGUAGE)
-        headers = {}
-        if STT_API_KEY:
-            headers["Authorization"] = f"Bearer {STT_API_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{STT_SPACE_URL}/transcribe",
-                data=form,
-                headers=headers,
-                timeout=STT_TIMEOUT
-            ) as resp:
-                if resp.status != 200:
-                    return ""
-                data = await resp.json()
-                text = data.get("text", "") if isinstance(data, dict) else ""
-                return str(text or "").strip()
+        attempts = max(1, STT_RETRY_COUNT)
+        for attempt in range(1, attempts + 1):
+            form = aiohttp.FormData()
+            form.add_field(
+                "audio",
+                wav_bytes,
+                filename="audio.wav",
+                content_type="audio/wav"
+            )
+            stt_language = stt_cfg.get("language", "")
+            if stt_language:
+                form.add_field("language", stt_language)
+            headers = {}
+            stt_token = stt_cfg.get("token", "")
+            if stt_token:
+                headers["Authorization"] = f"Bearer {stt_token}"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{stt_url}/transcribe",
+                        data=form,
+                        headers=headers,
+                        timeout=stt_cfg.get("timeout", STT_TIMEOUT)
+                    ) as resp:
+                        if resp.status != 200:
+                            err_text = await resp.text()
+                            print(f"[stt] HTTP {resp.status} on attempt {attempt}: {err_text[:200]}")
+                        else:
+                            data = await resp.json()
+                            text = data.get("text", "") if isinstance(data, dict) else ""
+                            text = str(text or "").strip()
+                            if text:
+                                return text
+                            print(f"[stt] empty text on attempt {attempt}")
+            except Exception as e:
+                print(f"[stt] exception on attempt {attempt}: {str(e)}")
+            if attempt < attempts:
+                await asyncio.sleep(max(0.1, STT_RETRY_DELAY))
     except Exception:
         return ""
+    return ""
 
 async def handle_voice_transcript(text: str, author: Optional[discord.User], reply_channel_id: int, from_name_trigger: bool = False):
     if not text:
@@ -522,6 +695,64 @@ def _remove_last_assistant_log(channel_id: int):
 
 config = load_config()
 load_runtime_state()
+
+long_term_memory = ""
+
+async def _load_github_summaries() -> str:
+    sync_cfg = config.get("memory_sync", {}) or {}
+    if not sync_cfg.get("enabled", False):
+        return ""
+    days = int(sync_cfg.get("days", 0) or 0)
+    if days <= 0:
+        return ""
+    tz_name = str(sync_cfg.get("timezone", "Asia/Taipei")).strip() or "Asia/Taipei"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Taipei")
+
+    github_cfg = config.get("github_backup", {}) or {}
+    repo = str(github_cfg.get("repo") or os.environ.get("GITHUB_REPO", "")).strip()
+    branch = str(github_cfg.get("branch") or os.environ.get("GITHUB_BRANCH", "main")).strip() or "main"
+    token = str(github_cfg.get("token") or os.environ.get("GITHUB_TOKEN", "")).strip()
+    if not repo or not token:
+        return ""
+
+    base_path = _get_github_summary_base_path()
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    async def _fetch_day_summary(date_str: str) -> str:
+        path = f"{base_path}{date_str}.md"
+        url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params={"ref": branch}, timeout=15) as resp:
+                    if resp.status != 200:
+                        return ""
+                    data = await resp.json()
+                    content_b64 = data.get("content", "")
+                    if not content_b64:
+                        return ""
+                    try:
+                        decoded = base64.b64decode(content_b64).decode("utf-8", errors="ignore")
+                    except Exception:
+                        return ""
+                    return decoded.strip()
+        except Exception:
+            return ""
+
+    now_local = datetime.now(tz)
+    results = []
+    for i in range(days):
+        day = now_local - timedelta(days=i)
+        date_str = day.strftime("%Y-%m-%d")
+        text = await _fetch_day_summary(date_str)
+        if text:
+            results.append(f"# {date_str}\n{text}")
+    return "\n\n".join(reversed(results))
 
 DINNER_OPTIONS = [
     "日式咖哩飯",
@@ -686,7 +917,14 @@ def _resolve_hasbas_base() -> str:
 
 
 def _resolve_voice_provider(profile: dict) -> str:
-    return str(profile.get("voice_provider", "") or os.environ.get("VOICE_PROVIDER", "")).strip().lower()
+    provider = str(profile.get("voice_provider", "") or os.environ.get("VOICE_PROVIDER", "")).strip().lower()
+    return provider or "quinoad"
+
+
+def _resolve_quinoad_base() -> str:
+    return str(
+        os.environ.get("QUINOAD_SPACE", "https://quinoad-voice-clone-multilingual.hf.space")
+    ).strip().rstrip("/")
 
 
 def _resolve_voice_sample_rate() -> int:
@@ -774,6 +1012,15 @@ def _split_audio_bytes(audio_bytes: bytes, max_bytes: int) -> list[bytes]:
     return [audio_bytes[i:i + max_bytes] for i in range(0, len(audio_bytes), max_bytes)]
 
 
+def _guess_audio_content_type(url: str) -> str:
+    lower = str(url or "").lower()
+    if lower.endswith(".wav"):
+        return "audio/wav"
+    if lower.endswith(".mp3"):
+        return "audio/mpeg"
+    return ""
+
+
 def _resolve_sample_url(profile: dict) -> str:
     explicit = str(profile.get("sample_url", "")).strip()
     if explicit:
@@ -802,6 +1049,13 @@ async def request_tts_from_hf(text: str, profile: dict, target_lang: Optional[st
         return await request_tts_from_hasanbasbunar(
             text=text,
             profile=profile,
+        )
+
+    if provider == "quinoad":
+        return await request_tts_from_quinoad(
+            text=text,
+            profile=profile,
+            target_lang=target_lang,
         )
 
     raw_sample_id = str(profile.get("sample_id", "")).strip()
@@ -916,15 +1170,22 @@ async def request_tts_from_tonyassi(text: str, profile: dict):
             async with session.get(audio_url, timeout=120) as resp:
                 if resp.status != 200:
                     err_text = await resp.text()
-                    return {"error": f"音訊下載失敗 ({resp.status}): {err_text[:200]}"}
+                    return {
+                        "audio_url": audio_url,
+                        "content_type": _guess_audio_content_type(audio_url),
+                        "warning": f"音訊下載失敗 ({resp.status}): {err_text[:200]}"
+                    }
                 audio_bytes = await resp.read()
-                try:
-                    resampled = _resample_audio_bytes(audio_bytes, _resolve_voice_sample_rate())
-                    return {"audio": resampled, "content_type": "audio/mpeg"}
-                except Exception:
-                    return {"audio": audio_bytes, "content_type": "audio/wav"}
+                header_type = str(resp.headers.get("Content-Type", "")).lower()
+                guessed = _guess_audio_content_type(audio_url)
+                content_type = header_type or guessed or "audio/wav"
+                return {"audio": audio_bytes, "content_type": content_type}
     except Exception as e:
-        return {"error": f"音訊下載失敗: {str(e)}"}
+        return {
+            "audio_url": audio_url,
+            "content_type": _guess_audio_content_type(audio_url),
+            "warning": f"音訊下載失敗: {str(e)}"
+        }
 
 
 async def request_tts_from_hasanbasbunar(text: str, profile: dict):
@@ -1008,16 +1269,111 @@ async def request_tts_from_hasanbasbunar(text: str, profile: dict):
                     err_text = await resp.text()
                     return {"error": f"音訊下載失敗 ({resp.status}): {err_text[:200]}"}
                 audio_bytes = await resp.read()
-                try:
-                    resampled = _resample_audio_bytes(audio_bytes, _resolve_voice_sample_rate())
-                    return {"audio": resampled, "content_type": "audio/mpeg"}
-                except Exception:
-                    return {"audio": audio_bytes, "content_type": "audio/wav"}
+                header_type = str(resp.headers.get("Content-Type", "")).lower()
+                guessed = _guess_audio_content_type(audio_url)
+                content_type = header_type or guessed or "audio/wav"
+                return {"audio": audio_bytes, "content_type": content_type}
     except Exception as e:
         return {"error": f"音訊下載失敗: {str(e)}"}
+
+
+async def request_tts_from_quinoad(text: str, profile: dict, target_lang: Optional[str] = None):
+    base_url = _resolve_quinoad_base()
+    sample_url = _resolve_sample_url(profile)
+    if not sample_url:
+        return {"error": "未設定 sample_url 或 VOICE_SAMPLE_BASE_URL"}
+
+    lang_label = target_lang or str(profile.get("text_lang", "")).strip() or "en"
+    payload = {
+        "data": [
+            text,
+            {"path": sample_url, "meta": {"_type": "gradio.FileData"}},
+            lang_label,
+        ]
+    }
+
+    call_url = f"{base_url}/gradio_api/call/predict"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(call_url, json=payload, timeout=120) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    return {"error": f"quinoad POST 失敗 ({resp.status}): {err_text[:200]}"}
+                data = await resp.json(content_type=None)
+                event_id = data.get("event_id") or data.get("id")
+                if not event_id:
+                    return {"error": "quinoad 回傳缺少 event_id"}
+
+        result_url = f"{base_url}/gradio_api/call/predict/{event_id}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(result_url, timeout=300) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    return {"error": f"quinoad GET 失敗 ({resp.status}): {err_text[:200]}"}
+                raw_text = await resp.text()
+    except Exception as e:
+        return {"error": f"quinoad 連線失敗: {str(e)}"}
+
+    audio_url = ""
+    for line in raw_text.splitlines():
+        if line.startswith("data:"):
+            try:
+                payload = json.loads(line.replace("data:", "", 1).strip())
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                data_list = payload.get("data")
+                if isinstance(data_list, list) and data_list:
+                    last = data_list[-1]
+                    if isinstance(last, dict):
+                        audio_url = last.get("url") or last.get("path") or ""
+                    elif isinstance(last, str):
+                        audio_url = last
+            if audio_url:
+                break
+
+    if not audio_url:
+        try:
+            parsed = json.loads(raw_text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            data_list = parsed.get("data")
+            if isinstance(data_list, list) and data_list:
+                last = data_list[-1]
+                if isinstance(last, dict):
+                    audio_url = last.get("url") or last.get("path") or ""
+                elif isinstance(last, str):
+                    audio_url = last
+
+    if not audio_url:
+        snippet = raw_text.strip().replace("\n", " ")[:500]
+        return {"error": f"quinoad 回傳未包含音訊 URL，原始回應片段: {snippet}"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(audio_url, timeout=120) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    return {
+                        "audio_url": audio_url,
+                        "content_type": _guess_audio_content_type(audio_url),
+                        "warning": f"音訊下載失敗 ({resp.status}): {err_text[:200]}"
+                    }
+                audio_bytes = await resp.read()
+                header_type = str(resp.headers.get("Content-Type", "")).lower()
+                guessed = _guess_audio_content_type(audio_url)
+                content_type = header_type or guessed or "audio/wav"
+                return {"audio": audio_bytes, "content_type": content_type}
+    except Exception as e:
+        return {
+            "audio_url": audio_url,
+            "content_type": _guess_audio_content_type(audio_url),
+            "warning": f"音訊下載失敗: {str(e)}"
+        }
 async def send_voice_response(channel: discord.abc.Messageable, text: str, profile: dict, target_lang: Optional[str] = None):
     provider = _resolve_voice_provider(profile)
-    if provider in {"tonyassi", "hasan", "hasanbasbunar"} or profile.get("use_tonyassi") or os.environ.get("USE_TONYASSI_TTS", "").strip():
+    if provider in {"tonyassi", "hasan", "hasanbasbunar", "quinoad"} or profile.get("use_tonyassi") or os.environ.get("USE_TONYASSI_TTS", "").strip():
         if not _resolve_sample_url(profile):
             await channel.send("⚠️ 尚未設定 sample_url 或 VOICE_SAMPLE_BASE_URL。請使用 /voice action:set 設定 sample_url。")
             return
@@ -1025,6 +1381,14 @@ async def send_voice_response(channel: discord.abc.Messageable, text: str, profi
     result = await request_tts_from_hf(text=text, profile=profile, target_lang=target_lang)
     if result.get("error"):
         await channel.send(f"⚠️ 語音生成失敗：{result['error']}")
+        return
+
+    audio_url = result.get("audio_url")
+    if audio_url:
+        warning = result.get("warning")
+        if warning:
+            await channel.send(f"⚠️ {warning}")
+        await channel.send(f"🔊 音訊連結：{audio_url}")
         return
 
     audio_bytes = result.get("audio")
@@ -1109,6 +1473,7 @@ async def fetch_models():
 intents = discord.Intents.default()
 intents.message_content = True 
 intents.voice_states = True
+intents.members = True
 
 class MyClient(discord.Client):
     def __init__(self):
@@ -1127,6 +1492,8 @@ class MyClient(discord.Client):
         self.loop.create_task(meal_reminder_checker())
         # 啟動每日總結背景任務
         self.loop.create_task(daily_summary_checker())
+        # 啟動長期記憶載入任務（從 GitHub summary）
+        self.loop.create_task(memory_sync_worker())
         # 語音接收已移除，不啟動語音片段檢查任務
 
 client = MyClient()
@@ -1167,6 +1534,13 @@ def build_system_prompt(channel_id=None, author=None):
     response_style = str(config.get("response_style", "")).strip()
     if response_style:
         prompt += f"\n\n【回應文風】\n{response_style}"
+        prompt += (
+            "\n【格式規則】"
+            "\n- 嚴格遵守上述回應文風。"
+            "\n- 不要使用多餘的換行或斷點，除非文風明確要求分段。"
+            "\n- 回覆必須連貫自然，避免無意義的空白行。"
+            "\n- 若文風包含『範例句』或示範內容，只能參考風格與語氣，不可照抄原句。"
+        )
 
     bot_name = str(config.get("bot_name", "")).strip()
     bot_nickname = str(config.get("bot_nickname", "")).strip()
@@ -1230,6 +1604,10 @@ def build_system_prompt(channel_id=None, author=None):
     if channel_id is not None:
         prompt += "\n\n【最近對話摘要（請用於辨識發言者）】\n"
         prompt += get_recent_speakers_summary(channel_id)
+
+    if long_term_memory:
+        prompt += "\n\n【長期記憶（近期總結）】\n"
+        prompt += long_term_memory
 
     
     forbidden_words = config.get("forbidden_words", []) or []
@@ -1295,6 +1673,25 @@ async def call_api(channel_id, user_text=None, special_instruction=None, author=
 
     body = {"model": config["model"], "messages": messages}
     
+    def _cleanup_response_text(text: str) -> str:
+        raw = str(text or "")
+        if not raw:
+            return raw
+        lines = [ln.rstrip() for ln in raw.splitlines()]
+        cleaned = []
+        blank_count = 0
+        for ln in lines:
+            if ln.strip() == "":
+                blank_count += 1
+                if blank_count > 1:
+                    continue
+                cleaned.append("")
+                continue
+            blank_count = 0
+            cleaned.append(ln)
+        result = "\n".join(cleaned).strip()
+        return result
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(endpoint, headers=headers, json=body, timeout=45) as resp:
@@ -1302,7 +1699,8 @@ async def call_api(channel_id, user_text=None, special_instruction=None, author=
                     res_text = await resp.text()
                     return f"❌ API 錯誤 ({resp.status}): {res_text[:100]}"
                 data = await resp.json()
-                return data["choices"][0]["message"]["content"]
+                content = data["choices"][0]["message"]["content"]
+                return _cleanup_response_text(content)
     except Exception as e:
         return f"❌ 連線失敗: {str(e)}"
 
@@ -1423,10 +1821,10 @@ def is_valid_timezone(tz_name: str):
 async def build_personalized_weather_text(location: str, raw_weather: str, channel_id=None):
     """用目前 system_prompt 角色語氣包裝天氣提醒。"""
     if raw_weather.startswith("❌") or raw_weather.startswith("⚠️"):
-        return raw_weather
+        return "⚠️ 天氣提醒請求失敗，請稍後再試或使用 /reroll 重試。"
 
     if not config.get("api_key"):
-        return raw_weather
+        return "⚠️ 天氣提醒請求失敗：未設定 API Key。"
 
     endpoint = f"{config['api_url'].rstrip('/')}/chat/completions"
     headers = {
@@ -1466,7 +1864,7 @@ async def build_personalized_weather_text(location: str, raw_weather: str, chann
     if content.startswith("⚠️"):
         return content
     if not content:
-        return raw_weather
+        return "⚠️ 天氣提醒請求失敗（LLM 回傳空），請使用 /reroll 重試。"
     if _normalize_text(content) == _normalize_text(raw_weather):
         retry_prompt = (
             system_content
@@ -1476,12 +1874,13 @@ async def build_personalized_weather_text(location: str, raw_weather: str, chann
         retry = await _call_weather_llm(retry_prompt)
         if retry and not retry.startswith("⚠️") and _normalize_text(retry) != _normalize_text(raw_weather):
             return retry
+        return "⚠️ 天氣提醒請求失敗（LLM 重複原始格式），請使用 /reroll 重試。"
     return content
 
 # ───────── 晚餐推薦工具 ─────────
 async def generate_dinner_suggestion(location: str, channel_id=None):
     if not config.get("api_key"):
-        return "⚠️ 請先設定 API Key。"
+        return "⚠️ 餐點提醒請求失敗：未設定 API Key。"
 
     location = location.strip()
     if not location:
@@ -1497,7 +1896,9 @@ async def generate_dinner_suggestion(location: str, channel_id=None):
     system_content += (
         "\n\n【任務】"
         "\n你現在要做『晚餐推薦』。"
-        "\n請根據使用者所在地點推薦 1~2 種在當地常見、容易取得的料理或餐點。"
+        "\n請先為使用者挑選 1 個最適合的餐點關鍵字（例如：拉麵、漢堡、咖哩、便當）。"
+        "\n由於無法直接抓取店家，請輸出『UberEats 搜尋連結 + 推薦餐點類型 + 一句理由』即可。"
+        "\n搜尋連結格式：https://www.ubereats.com/tw/search?q=<關鍵字>"
         "\n請以角色語氣回覆，簡短自然。"
     )
 
@@ -1515,11 +1916,14 @@ async def generate_dinner_suggestion(location: str, channel_id=None):
             async with session.post(endpoint, headers=headers, json=body, timeout=20) as resp:
                 if resp.status != 200:
                     res_text = await resp.text()
-                    return f"⚠️ 餐點提醒生成失敗 ({resp.status}): {res_text[:120]}"
+                    return f"⚠️ 餐點提醒請求失敗 ({resp.status}): {res_text[:120]}，請使用 /reroll 重試。"
                 data = await resp.json()
-                return data["choices"][0]["message"]["content"]
+                content = data["choices"][0]["message"]["content"]
+                if not content:
+                    return "⚠️ 餐點提醒請求失敗（LLM 回傳空），請使用 /reroll 重試。"
+                return content
     except Exception as e:
-        return f"⚠️ 餐點提醒生成失敗: {str(e)}"
+        return f"⚠️ 餐點提醒請求失敗: {str(e)}，請使用 /reroll 重試。"
 
 def _get_summary_file_path(date_str: str):
     base_path = str(os.environ.get("GITHUB_SUMMARY_PATH", "summaries/") or "summaries/")
@@ -1527,12 +1931,25 @@ def _get_summary_file_path(date_str: str):
         base_path += "/"
     return f"{base_path}{date_str}.md"
 
+def _get_github_summary_base_path() -> str:
+    github_cfg = config.get("github_backup", {}) or {}
+    custom_path = str(github_cfg.get("path", "")).strip()
+    if custom_path:
+        if not custom_path.endswith("/"):
+            custom_path += "/"
+        return custom_path
+    base_path = str(os.environ.get("GITHUB_SUMMARY_PATH", "summaries/") or "summaries/")
+    if not base_path.endswith("/"):
+        base_path += "/"
+    return base_path
+
 async def _generate_daily_summary(date_str: str):
     log_path = os.path.join(CHAT_LOG_DIR, f"{date_str}.jsonl")
     if not os.path.exists(log_path):
         return ""
 
     lines = []
+    entries = []
     try:
         with open(log_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -1542,6 +1959,11 @@ async def _generate_daily_summary(date_str: str):
                     content = item.get("content", "")
                     if role and content:
                         lines.append(f"{role}: {content}")
+                        entries.append({
+                            "ts": item.get("ts", ""),
+                            "role": role,
+                            "content": content,
+                        })
                 except:
                     continue
     except:
@@ -1566,6 +1988,34 @@ async def _generate_daily_summary(date_str: str):
         "\n要求：1) 100~200 字 2) 重點條列 3) 不洩露敏感資訊 4) 不要逐字重複對話。"
     )
 
+    async def _generate_summary_table(items: list[dict]) -> str:
+        if not items:
+            return ""
+        table_prompt = (
+            "你是一個摘要助手。請根據聊天紀錄挑出 5~10 個最重要事件，"
+            "輸出 Markdown 表格，欄位為：時間、重要事件。"
+            "時間請用 24 小時 HH:MM，若無法判斷請用 '--:--'。"
+            "只輸出表格，不要其他文字。"
+        )
+        table_body = {
+            "model": config["model"],
+            "messages": [
+                {"role": "system", "content": table_prompt},
+                {"role": "user", "content": json.dumps(items[-300:], ensure_ascii=False)}
+            ]
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(endpoint, headers=headers, json=table_body, timeout=30) as resp:
+                    if resp.status != 200:
+                        return ""
+                    data = await resp.json()
+                    return str(data["choices"][0]["message"]["content"] or "").strip()
+        except:
+            return ""
+
+    table_md = await _generate_summary_table(entries)
+
     body = {
         "model": config["model"],
         "messages": [
@@ -1580,19 +2030,34 @@ async def _generate_daily_summary(date_str: str):
                 if resp.status != 200:
                     return ""
                 data = await resp.json()
-                return data["choices"][0]["message"]["content"].strip()
+                summary_text = data["choices"][0]["message"]["content"].strip()
+                if table_md:
+                    return "\n".join([
+                        f"# {date_str} 摘要",
+                        "\n## 重要事件表",
+                        table_md,
+                        "\n## 總結",
+                        summary_text
+                    ])
+                return summary_text
     except:
         return ""
 
 async def _push_summary_to_github(date_str: str, content: str):
-    repo = str(os.environ.get("GITHUB_REPO", "")).strip()
-    branch = str(os.environ.get("GITHUB_BRANCH", "main")).strip() or "main"
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    github_cfg = config.get("github_backup", {}) or {}
+    repo = str(github_cfg.get("repo") or os.environ.get("GITHUB_REPO", "")).strip()
+    branch = str(github_cfg.get("branch") or os.environ.get("GITHUB_BRANCH", "main")).strip() or "main"
+    token = str(github_cfg.get("token") or os.environ.get("GITHUB_TOKEN", "")).strip()
 
     if not repo or not token:
         return False, "⚠️ GitHub 未設定，已略過推送。"
 
-    path = _get_summary_file_path(date_str)
+    path = f"{_get_github_summary_base_path()}{date_str}.md"
+    custom_path = str(github_cfg.get("path", "")).strip()
+    if custom_path:
+        if not custom_path.endswith("/"):
+            custom_path += "/"
+        path = f"{custom_path}{date_str}.md"
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     headers = {
         "Authorization": f"token {token}",
@@ -1657,6 +2122,27 @@ async def daily_summary_checker():
             if ok:
                 config.setdefault("summary_schedule", {})["last_sent_date"] = today
                 save_config(config)
+
+async def memory_sync_worker():
+    await client.wait_until_ready()
+    global long_term_memory
+    while not client.is_closed():
+        await asyncio.sleep(30)
+        sync_cfg = config.get("memory_sync", {}) or {}
+        if not sync_cfg.get("enabled", False):
+            continue
+        tz_name = str(sync_cfg.get("timezone", "Asia/Taipei")).strip() or "Asia/Taipei"
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("Asia/Taipei")
+        today = datetime.now(tz).strftime("%Y-%m-%d")
+        if sync_cfg.get("last_loaded_date") == today and long_term_memory:
+            continue
+        long_term_memory = await _load_github_summaries()
+        sync_cfg["last_loaded_date"] = today
+        config["memory_sync"] = sync_cfg
+        save_config(config)
 
 async def weather_reminder_checker():
     """每天定時推送一次天氣提醒到指定頻道。"""
@@ -1806,6 +2292,28 @@ async def on_ready():
 @client.event
 async def on_message(message):
     if message.author == client.user: return
+
+    # 私訊（DM）：僅回覆 OWNER
+    if isinstance(message.channel, discord.DMChannel):
+        if message.author.id != OWNER_ID:
+            return
+        display_text = f"{message.author.display_name}: {message.content}"
+        add_to_history(message.channel.id, "user", display_text)
+        channel_last_time[message.channel.id] = time.time()
+        save_runtime_state()
+        async with message.channel.typing():
+            reply = await call_api(
+                message.channel.id,
+                special_instruction=(
+                    f"你正在私訊回覆 {message.author.display_name}。"
+                    "請維持人設並簡短自然。"
+                ),
+                author=message.author
+            )
+            await message.reply(reply)
+            await maybe_send_voice(message.channel, reply, author=message.author)
+            add_to_history(message.channel.id, "assistant", reply)
+        return
     
     # 紀錄訊息（包含發言者名稱，這能幫助 AI 識別誰是誰）
     display_text = f"{message.author.display_name}: {message.content}"
@@ -1815,6 +2323,9 @@ async def on_message(message):
 
     # 情況 A：被標記 (@Bot) -> 必定回覆
     if client.user in message.mentions:
+        if await _should_block_nsfw(message.channel, message.content):
+            await message.reply("⚠️ 此頻道人數較多，為避免隱私外洩，無法討論 NSFW 話題。請改用私密頻道。")
+            return
         async with message.channel.typing():
             reply = await call_api(
                 message.channel.id,
@@ -1831,6 +2342,12 @@ async def on_message(message):
 
     # 情況 B：沒被標記 -> 判斷是否要自動插嘴
     if _is_chime_channel_allowed(message.channel.id):
+        emoji = await _select_reaction_emoji(message.content)
+        if emoji:
+            try:
+                await message.add_reaction(emoji)
+            except Exception:
+                pass
         name_triggered = _is_name_triggered(message.content)
         if not config.get("auto_chime_in", True) and not name_triggered:
             return
@@ -1857,6 +2374,8 @@ async def on_message(message):
                     break
 
         if should_chime:
+            if await _should_block_nsfw(message.channel, message.content):
+                return
             async with message.channel.typing():
                 chime_reply = await call_api(
                     message.channel.id,
@@ -2799,6 +3318,7 @@ async def set_voice_listen(
     cfg = get_voice_listen_config()
 
     if action.value == "status":
+        stt_cfg = get_stt_config()
         await interaction.followup.send(
             "\n".join([
                 f"✅ 啟用狀態：{cfg['enabled']}",
@@ -2806,76 +3326,290 @@ async def set_voice_listen(
                 f"💬 回覆頻道 ID：{cfg['reply_channel_id'] or '未設定'}",
                 f"🧷 名字觸發：{cfg['name_trigger_enabled']}",
                 f"🔤 名字清單：{', '.join(cfg['name_triggers']) if cfg['name_triggers'] else '（空）'}",
-                f"🛰️ STT 服務：{STT_SPACE_URL or '未設定'}",
+                f"🛰️ STT 服務：{stt_cfg.get('url') or '未設定'}",
                 "ℹ️ 語音辨識需外部部署 STT 服務並填入 STT_SPACE_URL 才能啟用。"
             ]),
             ephemeral=True
         )
         return
-    if action.value == "join":
-        parsed = _parse_channel_id(str(voice_channel_id))
-        if parsed is None:
-            await interaction.followup.send("⚠️ 請輸入有效語音頻道 ID（數字或 #頻道）。", ephemeral=True)
-            return
-        reply_parsed = _parse_channel_id(str(reply_channel_id))
-        if reply_parsed is None:
-            await interaction.followup.send("⚠️ 請輸入有效回覆頻道 ID（數字或 #頻道）。", ephemeral=True)
-            return
-        channel = client.get_channel(parsed)
-        if channel is None:
-            try:
-                channel = await client.fetch_channel(parsed)
-            except Exception:
-                channel = None
-        if channel is None or not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-            await interaction.followup.send("⚠️ 找不到語音頻道或頻道類型不支援。", ephemeral=True)
-            return
-        reply_channel = client.get_channel(reply_parsed)
-        if reply_channel is None:
-            try:
-                reply_channel = await client.fetch_channel(reply_parsed)
-            except Exception:
-                reply_channel = None
-        if reply_channel is None or not isinstance(reply_channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
-            await interaction.followup.send("⚠️ 找不到回覆頻道或頻道類型不支援。", ephemeral=True)
-            return
-        if client.voice_client:
-            try:
-                await client.voice_client.disconnect(force=True)
-            except Exception:
-                pass
-        try:
-            vc = await channel.connect()
-            client.voice_client = vc
-        except Exception as e:
-            debug_info = f"{type(e).__name__}: {e}"
-            await interaction.followup.send(
-                "\n".join([
-                    "❌ 進入語音頻道失敗。",
-                    f"錯誤：{debug_info}",
-                    "提示：請確認 opus/ffmpeg/PyNaCl 是否可用與語音權限。"
-                ]),
-                ephemeral=True
-            )
-            return
-        listen_cfg = config.setdefault("voice_listen", {})
-        listen_cfg["enabled"] = True
-        listen_cfg["voice_channel_id"] = int(parsed)
-        listen_cfg["reply_channel_id"] = int(reply_channel.id)
-        if names:
-            parsed_names = [n.strip() for n in str(names).split(",") if n.strip()]
-            listen_cfg["name_triggers"] = parsed_names
-            listen_cfg["name_trigger_enabled"] = True if parsed_names else False
-        save_config(config)
+
+
+@client.tree.command(name="set_stt", description="設定/查看 STT 服務（URL/Token/Timeout/Language）")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="set", value="set"),
+        app_commands.Choice(name="clear", value="clear"),
+        app_commands.Choice(name="status", value="status"),
+    ]
+)
+async def set_stt(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+    timeout: Optional[float] = None,
+    language: Optional[str] = None,
+):
+    if not is_owner(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    if action.value == "status":
+        stt_cfg = get_stt_config()
         await interaction.followup.send(
             "\n".join([
-                f"✅ 已進入語音頻道：`{parsed}`",
-                f"💬 回覆頻道：`{reply_channel.id}`",
-                f"🧷 名字觸發：{bool(listen_cfg.get('name_trigger_enabled', False))}",
+                f"🛰️ STT URL：{stt_cfg.get('url') or '未設定'}",
+                f"🔐 Token：{'已設定' if stt_cfg.get('token') else '未設定'}",
+                f"⏱️ Timeout：{stt_cfg.get('timeout')} 秒",
+                f"🌐 Language：{stt_cfg.get('language') or '未設定'}",
             ]),
             ephemeral=True
         )
         return
+
+    if action.value == "clear":
+        config["stt"] = {
+            "url": "",
+            "token": "",
+            "timeout": 0,
+            "language": ""
+        }
+        save_config(config)
+        await interaction.followup.send("✅ 已清除 STT 設定，將回退到環境變數。", ephemeral=True)
+        return
+
+    if not url:
+        await interaction.followup.send("⚠️ 請提供 STT URL。", ephemeral=True)
+        return
+
+    clean_url = str(url).strip().rstrip("/")
+    if not clean_url.startswith("http://") and not clean_url.startswith("https://"):
+        await interaction.followup.send("⚠️ STT URL 需包含 http(s)://", ephemeral=True)
+        return
+
+    timeout_val = 0
+    if timeout is not None:
+        try:
+            timeout_val = float(timeout)
+        except Exception:
+            await interaction.followup.send("⚠️ timeout 必須是數字（秒）。", ephemeral=True)
+            return
+        if timeout_val <= 0:
+            await interaction.followup.send("⚠️ timeout 必須大於 0。", ephemeral=True)
+            return
+
+    config["stt"] = {
+        "url": clean_url,
+        "token": str(token or "").strip(),
+        "timeout": timeout_val,
+        "language": str(language or "").strip(),
+    }
+    save_config(config)
+    await interaction.followup.send(
+        "\n".join([
+            "✅ 已更新 STT 設定。",
+            f"🛰️ URL：`{clean_url}`",
+            f"🔐 Token：{'已設定' if token else '未設定'}",
+            f"⏱️ Timeout：`{timeout_val or '使用環境變數'}`",
+            f"🌐 Language：`{language or '使用環境變數'}`",
+        ]),
+        ephemeral=True
+    )
+
+
+@client.tree.command(name="set_nsfw_guard", description="設定頻道人數限制的 NSFW 防護")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="set", value="set"),
+        app_commands.Choice(name="clear", value="clear"),
+        app_commands.Choice(name="status", value="status"),
+    ]
+)
+async def set_nsfw_guard(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    max_members: Optional[int] = None,
+):
+    if not is_owner(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guard = config.get("nsfw_guard", {}) or {}
+
+    if action.value == "status":
+        await interaction.followup.send(
+            "\n".join([
+                f"✅ 啟用狀態：{guard.get('enabled', False)}",
+                f"👥 最大人數：{guard.get('max_members', 0)}",
+            ]),
+            ephemeral=True
+        )
+        return
+
+    if action.value == "clear":
+        config["nsfw_guard"] = {"enabled": False, "max_members": 0}
+        save_config(config)
+        await interaction.followup.send("✅ 已關閉 NSFW 防護限制。", ephemeral=True)
+        return
+
+    if max_members is None or max_members <= 0:
+        await interaction.followup.send("⚠️ 請提供大於 0 的 max_members。", ephemeral=True)
+        return
+
+    config["nsfw_guard"] = {"enabled": True, "max_members": int(max_members)}
+    save_config(config)
+    await interaction.followup.send(
+        f"✅ 已啟用 NSFW 防護：當頻道人數 > {int(max_members)} 時，禁止 NSFW 話題。",
+        ephemeral=True
+    )
+
+
+@client.tree.command(name="set_github_backup", description="設定 GitHub 備份參數")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="set", value="set"),
+        app_commands.Choice(name="clear", value="clear"),
+        app_commands.Choice(name="status", value="status"),
+    ]
+)
+async def set_github_backup(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    repo: Optional[str] = None,
+    branch: Optional[str] = None,
+    token: Optional[str] = None,
+    path: Optional[str] = None,
+):
+    if not is_owner(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = config.get("github_backup", {}) or {}
+
+    if action.value == "status":
+        await interaction.followup.send(
+            "\n".join([
+                f"📦 Repo：{cfg.get('repo') or os.environ.get('GITHUB_REPO', '') or '未設定'}",
+                f"🌿 Branch：{cfg.get('branch') or os.environ.get('GITHUB_BRANCH', 'main') or 'main'}",
+                f"🔐 Token：{'已設定' if (cfg.get('token') or os.environ.get('GITHUB_TOKEN')) else '未設定'}",
+                f"📁 Path：{cfg.get('path') or os.environ.get('GITHUB_SUMMARY_PATH', 'summaries/')}",
+            ]),
+            ephemeral=True
+        )
+        return
+
+    if action.value == "clear":
+        config["github_backup"] = {"repo": "", "branch": "", "token": "", "path": ""}
+        save_config(config)
+        await interaction.followup.send("✅ 已清除 GitHub 備份設定，將回退環境變數。", ephemeral=True)
+        return
+
+    if not repo:
+        await interaction.followup.send("⚠️ 請提供 repo（例如 owner/repo）。", ephemeral=True)
+        return
+
+    cleaned_repo = str(repo).strip()
+    if "/" not in cleaned_repo:
+        await interaction.followup.send("⚠️ repo 格式應為 owner/repo。", ephemeral=True)
+        return
+
+    config["github_backup"] = {
+        "repo": cleaned_repo,
+        "branch": str(branch or "").strip(),
+        "token": str(token or "").strip(),
+        "path": str(path or "").strip(),
+    }
+    save_config(config)
+    await interaction.followup.send(
+        "\n".join([
+            "✅ 已更新 GitHub 備份設定。",
+            f"📦 Repo：`{cleaned_repo}`",
+            f"🌿 Branch：`{branch or '使用環境變數'}`",
+            f"🔐 Token：{'已設定' if token else '未設定'}",
+            f"📁 Path：`{path or '使用環境變數'}`",
+        ]),
+        ephemeral=True
+    )
+    return
+
+
+@client.tree.command(name="set_memory_sync", description="設定從 GitHub summary 載入長期記憶")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="set", value="set"),
+        app_commands.Choice(name="clear", value="clear"),
+        app_commands.Choice(name="status", value="status"),
+        app_commands.Choice(name="reload", value="reload"),
+    ]
+)
+async def set_memory_sync(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    days: Optional[int] = None,
+    tz_name: Optional[str] = None,
+):
+    if not is_owner(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    cfg = config.get("memory_sync", {}) or {}
+
+    if action.value == "status":
+        await interaction.followup.send(
+            "\n".join([
+                f"✅ 啟用狀態：{cfg.get('enabled', False)}",
+                f"📅 天數：{cfg.get('days', 7)}",
+                f"🌐 時區：{cfg.get('timezone', 'Asia/Taipei')}",
+                f"🕒 最後載入：{cfg.get('last_loaded_date', '') or '尚未載入'}",
+                "ℹ️ 每天第一次載入會較慢（需從 GitHub 讀取 summary）。"
+            ]),
+            ephemeral=True
+        )
+        return
+
+    if action.value == "clear":
+        config["memory_sync"] = {"enabled": False, "days": 7, "timezone": "Asia/Taipei", "last_loaded_date": ""}
+        save_config(config)
+        await interaction.followup.send("✅ 已關閉長期記憶載入。", ephemeral=True)
+        return
+
+    if action.value == "reload":
+        global long_term_memory
+        long_term_memory = await _load_github_summaries()
+        tz_val = cfg.get("timezone", "Asia/Taipei")
+        cfg["last_loaded_date"] = datetime.now(ZoneInfo(tz_val)).strftime("%Y-%m-%d")
+        config["memory_sync"] = cfg
+        save_config(config)
+        await interaction.followup.send("✅ 已重新載入長期記憶（可能需要幾秒）。", ephemeral=True)
+        return
+
+    if days is None or days <= 0:
+        await interaction.followup.send("⚠️ 請提供大於 0 的 days。", ephemeral=True)
+        return
+
+    if tz_name and not is_valid_timezone(tz_name):
+        await interaction.followup.send("⚠️ 時區名稱錯誤，例如 Asia/Taipei。", ephemeral=True)
+        return
+
+    config["memory_sync"] = {
+        "enabled": True,
+        "days": int(days),
+        "timezone": tz_name.strip() if tz_name else cfg.get("timezone", "Asia/Taipei"),
+        "last_loaded_date": ""
+    }
+    save_config(config)
+    await interaction.followup.send(
+        "\n".join([
+            "✅ 已啟用長期記憶載入。",
+            f"📅 天數：`{int(days)}`",
+            f"🌐 時區：`{(tz_name or cfg.get('timezone', 'Asia/Taipei'))}`",
+            "ℹ️ 每天第一次載入會較慢（需從 GitHub 讀取 summary）。"
+        ]),
+        ephemeral=True
+    )
 
     if action.value == "leave":
         if client.voice_client:
