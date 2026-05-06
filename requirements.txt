@@ -1,0 +1,4 @@
+py-cord==2.5.0
+PyNaCl
+aiohttp
+flask

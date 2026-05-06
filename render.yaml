@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: discord-ai-lover
+    env: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: API_URL
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: MODEL
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
